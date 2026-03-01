@@ -1,6 +1,20 @@
-[package]
-name = "lazy-container"
-version = "0.1.0"
-edition = "2024"
+[workspace.lints.rust]
+unsafe_code = "forbid"
+# unused = "allow" # For experimental dev.
 
-[dependencies]
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/lazy-container"
+]
+
+[workspace.dependencies]
+ratatui = "0.30.0"
+color-eyre = "0.6.5"
+crossterm = "0.29.0"
