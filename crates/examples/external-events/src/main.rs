@@ -163,13 +163,11 @@ impl App {
         // With `event::poll(duration)` the thread sleeps *at most* `duration`.
         // After that it returns `false` and we fall through to check the watcher.
         // 100 ms means the watcher response feels instant to a human.
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press {
                     self.handle_key_event(key);
                 }
-            }
-        }
 
         // --- Watcher events --------------------------------------------------
         //
