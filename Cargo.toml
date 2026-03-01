@@ -11,6 +11,7 @@ codegen-units = 1
 [workspace]
 resolver = "2"
 members = [
+    "crates/examples/simple-frame",
     "crates/lazy-container"
 ]
 
