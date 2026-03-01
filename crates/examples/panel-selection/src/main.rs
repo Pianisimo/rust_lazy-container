@@ -36,13 +36,13 @@ use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
+    DefaultTerminal, Frame,
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     symbols::border,
     text::{Line, Text},
     widgets::{Block, Widget},
-    DefaultTerminal, Frame,
 };
 
 const ITEM_COUNT: usize = 8;
@@ -218,7 +218,11 @@ impl App {
 /// - `buf: &mut Buffer` — the frame's cell grid; write styled characters here.
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let panel_name = if self.active_panel == 0 { "Left" } else { "Right" };
+        let panel_name = if self.active_panel == 0 {
+            "Left"
+        } else {
+            "Right"
+        };
         let row_num = self.selected_rows[self.active_panel] + 1;
 
         // A `Line` can be built from a mix of plain `&str`s and styled `Span`s.
