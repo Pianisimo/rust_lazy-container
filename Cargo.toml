@@ -14,7 +14,8 @@ members = [
     "crates/examples/simple-frame",
     "crates/examples/panel-selection",
     "crates/examples/external-events",
-    "crates/lazy-container"
+    "crates/lazy-container",
+    "crates/lib"
 ]
 
 [workspace.dependencies]

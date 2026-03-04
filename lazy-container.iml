@@ -8,6 +8,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/examples/external-events/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/examples/panel-selection/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/examples/simple-frame/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/lib/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/crates/lazy-container/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
