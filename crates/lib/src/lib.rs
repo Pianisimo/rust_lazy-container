@@ -1,4 +1,5 @@
 use std::io;
+use std::process::Command;
 
 pub use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 pub use ratatui::{
@@ -11,14 +12,26 @@ pub use ratatui::{
     widgets::{Block, Paragraph, Widget},
 };
 
-#[derive(Debug, Default)]
+mod screens;
+
+use screens::{ContainerScreen, ContainerStatus, Screen, StatusScreen};
+
+#[derive(Debug)]
 pub struct App {
-    counter: u8,
+    screen: Screen,
     exit: bool,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            screen: Screen::default(),
+            exit: false,
+        }
+    }
+}
+
 impl App {
-    /// runs the application's main loop until the user quits
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
@@ -33,8 +46,6 @@ impl App {
 
     fn handle_events(&mut self) -> io::Result<()> {
         match event::read()? {
-            // it's important to check that the event is a key press event as
-            // crossterm also emits key release and repeat events on Windows.
             Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
                 self.handle_key_event(key_event)
             }
@@ -45,50 +56,112 @@ impl App {
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode::Char('q') => self.exit(),
-            KeyCode::Left => self.decrement_counter(),
-            KeyCode::Right => self.increment_counter(),
+            KeyCode::Char('q') => self.exit = true,
+            KeyCode::Enter => self.handle_enter(),
+            KeyCode::Char('s') => self.handle_start_stop(),
+            KeyCode::Esc => self.handle_esc(),
             _ => {}
         }
     }
 
-    fn exit(&mut self) {
-        self.exit = true;
+    fn handle_enter(&mut self) {
+        let is_running =
+            matches!(&self.screen, Screen::Status(s) if s.status == ContainerStatus::Running);
+        if is_running {
+            self.screen = Screen::Containers(ContainerScreen::fetch());
+        }
     }
 
-    fn increment_counter(&mut self) {
-        self.counter += 1;
+    fn handle_start_stop(&mut self) {
+        let is_running = match &self.screen {
+            Screen::Status(s) => Some(s.status == ContainerStatus::Running),
+            _ => None,
+        };
+        if let Some(running) = is_running {
+            if running {
+                run_command(&["container", "system", "stop"]);
+            } else {
+                run_command(&["container", "system", "start"]);
+            }
+            self.screen = Screen::Status(StatusScreen::fetch());
+        }
     }
 
-    fn decrement_counter(&mut self) {
-        self.counter -= 1;
+    fn handle_esc(&mut self) {
+        if matches!(&self.screen, Screen::Containers(_)) {
+            self.screen = Screen::Status(StatusScreen::fetch());
+        }
+    }
+}
+
+fn run_command(args: &[&str]) {
+    if let Some((cmd, rest)) = args.split_first() {
+        let _ = Command::new(cmd).args(rest).output();
     }
 }
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let title = Line::from(" Counter App Tutorial ".bold());
-        let instructions = Line::from(vec![
-            " Decrement ".into(),
-            "<Left>".blue().bold(),
-            " Increment ".into(),
-            "<Right>".blue().bold(),
+        match &self.screen {
+            Screen::Status(s) => render_status(s, area, buf),
+            Screen::Containers(c) => render_containers(c, area, buf),
+        }
+    }
+}
+
+fn render_status(screen: &StatusScreen, area: Rect, buf: &mut Buffer) {
+    let status_span = match screen.status {
+        ContainerStatus::Running => "Running".green().bold(),
+        ContainerStatus::NotRunning => "Not Running".red().bold(),
+    };
+
+    let instructions = match screen.status {
+        ContainerStatus::Running => Line::from(vec![
+            " Containers ".into(),
+            "<Enter>".blue().bold(),
+            " Stop ".into(),
+            "<S>".blue().bold(),
             " Quit ".into(),
             "<Q> ".blue().bold(),
-        ]);
-        let block = Block::bordered()
-            .title(title.centered())
-            .title_bottom(instructions.centered())
-            .border_set(border::THICK);
+        ]),
+        ContainerStatus::NotRunning => Line::from(vec![
+            " Start ".into(),
+            "<S>".blue().bold(),
+            " Quit ".into(),
+            "<Q> ".blue().bold(),
+        ]),
+    };
 
-        let counter_text = Text::from(vec![Line::from(vec![
-            "Value: ".into(),
-            self.counter.to_string().yellow(),
-        ])]);
+    let block = Block::bordered()
+        .title(Line::from(" Apple Container System ".bold()).centered())
+        .title_bottom(instructions.centered())
+        .border_set(border::THICK);
 
-        Paragraph::new(counter_text)
-            .centered()
-            .block(block)
-            .render(area, buf);
-    }
+    let content = Text::from(vec![
+        Line::from(vec!["Status: ".into(), status_span]),
+        Line::from(screen.message.as_str()),
+    ]);
+
+    Paragraph::new(content)
+        .centered()
+        .block(block)
+        .render(area, buf);
+}
+
+fn render_containers(screen: &ContainerScreen, area: Rect, buf: &mut Buffer) {
+    let instructions = Line::from(vec![
+        " Back ".into(),
+        "<Esc>".blue().bold(),
+        " Quit ".into(),
+        "<Q> ".blue().bold(),
+    ]);
+
+    let block = Block::bordered()
+        .title(Line::from(" Containers ".bold()).centered())
+        .title_bottom(instructions.centered())
+        .border_set(border::THICK);
+
+    Paragraph::new(screen.content.as_str())
+        .block(block)
+        .render(area, buf);
 }
