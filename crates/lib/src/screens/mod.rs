@@ -1,24 +1,24 @@
 use std::io;
 use std::process::Command;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
-    DefaultTerminal, Frame,
-    buffer::Buffer,
-    layout::Rect,
+    buffer::Buffer, layout::Rect,
     widgets::Widget,
+    DefaultTerminal,
+    Frame,
 };
 
-mod container_screen;
+mod home_screen;
 mod status_screen;
 
-pub(crate) use container_screen::ContainerScreen;
-pub(crate) use status_screen::{ContainerStatus, StatusScreen};
+pub(crate) use home_screen::HomeScreen;
+pub(crate) use status_screen::StatusScreen;
 
 #[derive(Debug)]
 pub(crate) enum Screen {
     Status(StatusScreen),
-    Containers(ContainerScreen),
+    Home(HomeScreen),
 }
 
 impl Default for Screen {
@@ -70,7 +70,15 @@ impl App {
             KeyCode::Char('q') => self.exit = true,
             KeyCode::Enter => StatusScreen::handle_enter(self),
             KeyCode::Char('s') => StatusScreen::handle_start_stop(self),
-            KeyCode::Esc => ContainerScreen::handle_esc(self),
+            KeyCode::Esc => HomeScreen::handle_esc(self),
+            KeyCode::Up if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
+                HomeScreen::handle_shift_up(self)
+            }
+            KeyCode::Down if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
+                HomeScreen::handle_shift_down(self)
+            }
+            KeyCode::Up => HomeScreen::move_up(self),
+            KeyCode::Down => HomeScreen::move_down(self),
             _ => {}
         }
     }
@@ -86,8 +94,7 @@ impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         match &self.screen {
             Screen::Status(s) => s.render(area, buf),
-            Screen::Containers(c) => c.render(area, buf),
+            Screen::Home(h) => h.render(area, buf),
         }
     }
 }
-

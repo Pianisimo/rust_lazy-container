@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use super::{App, ContainerScreen, Screen, run_command};
+use super::{App, HomeScreen, Screen, run_command};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -60,7 +60,7 @@ impl StatusScreen {
         let should_change =
             matches!(&app.screen, Screen::Status(s) if s.status == ContainerStatus::Running);
         if should_change {
-            app.screen = Screen::Containers(ContainerScreen::fetch());
+            app.screen = Screen::Home(HomeScreen::fetch());
         }
     }
 
