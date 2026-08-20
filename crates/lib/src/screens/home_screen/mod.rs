@@ -38,6 +38,24 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// One containers-panel row. The header uses it too, so the column widths
+/// cannot drift apart.
+fn container_row(prefix: &str, id: &str, state: &str, addr: &str) -> String {
+    format!("{prefix}{id:<15} {state:<10}  {addr}")
+}
+
+/// One images-panel row. Widths add up to 76: the panel's inner width at 80
+/// columns, with the longest image name (37) and digest (12) in place.
+fn image_row(prefix: &str, name: &str, tag: &str, digest: &str, platform: &str) -> String {
+    format!("{prefix}{name:<38}{tag:<8}{digest:<13}{platform}")
+}
+
+/// Column titles for a list panel, dimmed so they read as a ruler rather than
+/// as another row.
+fn header_line(text: String) -> Line<'static> {
+    Line::from(text.trim_end().to_string()).dark_gray().bold()
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct HomeScreen {
     active_panel: usize,
@@ -407,31 +425,23 @@ impl HomeScreen {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let lines: Vec<Line> = self
-            .visible_containers()
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let addr_part = if !c.addr.is_empty() {
-                    format!("  {}", c.addr)
-                } else {
-                    String::new()
-                };
-                let prefix = if i == selected && is_active {
-                    " > "
-                } else {
-                    "   "
-                };
-                let text = format!("{prefix}{:<15} {:<10}{addr_part}", c.id, c.state);
-                if i == selected && is_active {
-                    Line::from(text).yellow().bold()
-                } else if c.is_running() {
-                    Line::from(text)
-                } else {
-                    Line::from(text).dark_gray()
-                }
-            })
-            .collect();
+        let mut lines: Vec<Line> = vec![header_line(container_row("   ", "NAME", "STATE", "IP"))];
+
+        lines.extend(self.visible_containers().iter().enumerate().map(|(i, c)| {
+            let prefix = if i == selected && is_active {
+                " > "
+            } else {
+                "   "
+            };
+            let text = container_row(prefix, &c.id, &c.state, &c.addr);
+            if i == selected && is_active {
+                Line::from(text).yellow().bold()
+            } else if c.is_running() {
+                Line::from(text)
+            } else {
+                Line::from(text).dark_gray()
+            }
+        }));
 
         ratatui::text::Text::from(lines).render(inner, buf);
     }
@@ -451,32 +461,23 @@ impl HomeScreen {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let lines: Vec<Line> = self
-            .images
-            .iter()
-            .enumerate()
-            .map(|(i, img)| {
-                let prefix = if i == selected && is_active {
-                    " > "
-                } else {
-                    "   "
-                };
-                // Widths add up to 76: the panel's inner width at 80 columns,
-                // with the longest image name (37) and digest (12) in place.
-                let text = format!(
-                    "{prefix}{:<38}{:<8}{:<13}{}",
-                    img.name,
-                    img.tag,
-                    img.digest,
-                    img.platform()
-                );
-                if i == selected && is_active {
-                    Line::from(text).yellow().bold()
-                } else {
-                    Line::from(text)
-                }
-            })
-            .collect();
+        let mut lines: Vec<Line> = vec![header_line(image_row(
+            "   ", "NAME", "TAG", "DIGEST", "PLATFORM",
+        ))];
+
+        lines.extend(self.images.iter().enumerate().map(|(i, img)| {
+            let prefix = if i == selected && is_active {
+                " > "
+            } else {
+                "   "
+            };
+            let text = image_row(prefix, &img.name, &img.tag, &img.digest, &img.platform());
+            if i == selected && is_active {
+                Line::from(text).yellow().bold()
+            } else {
+                Line::from(text)
+            }
+        }));
 
         ratatui::text::Text::from(lines).render(inner, buf);
     }
@@ -513,6 +514,37 @@ mod tests {
             show_help: false,
             create_input: None,
         }
+    }
+
+    /// The column a title sits in, so a header can be checked against a row.
+    fn offsets(line: &str) -> Vec<usize> {
+        line.match_indices(|c: char| !c.is_whitespace())
+            .filter(|(i, _)| *i == 0 || line.as_bytes()[i - 1] == b' ')
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn container_headers_line_up_with_their_rows() {
+        let header = container_row("   ", "NAME", "STATE", "IP");
+        let row = container_row("   ", "bravo", "running", "192.168.64.3");
+        assert_eq!(offsets(&header), offsets(&row));
+    }
+
+    #[test]
+    fn image_headers_line_up_with_their_rows() {
+        let header = image_row("   ", "NAME", "TAG", "DIGEST", "PLATFORM");
+        let row = image_row("   ", "alpine", "edge", "020dfcbaaf4c", "linux/arm64 +6");
+        // The platform cell is the only one with an internal space.
+        assert_eq!(offsets(&header), offsets(&row)[..offsets(&header).len()]);
+    }
+
+    #[test]
+    fn a_container_with_no_address_leaves_no_trailing_padding() {
+        assert_eq!(
+            container_row("   ", "alpha", "stopped", "").trim_end(),
+            "   alpha           stopped"
+        );
     }
 
     #[test]
