@@ -630,10 +630,7 @@ mod tests {
 
     #[test]
     fn the_dialog_only_opens_over_a_selected_image() {
-        let mut app = App {
-            screen: Screen::Home(home()),
-            exit: false,
-        };
+        let mut app = App::with_screen(Screen::Home(home()));
 
         // Containers panel has focus, so there is nothing to create from.
         HomeScreen::open_create_dialog(&mut app);
@@ -648,10 +645,7 @@ mod tests {
 
     #[test]
     fn the_dialog_swallows_keys_that_would_otherwise_act() {
-        let mut app = App {
-            screen: Screen::Home(home()),
-            exit: false,
-        };
+        let mut app = App::with_screen(Screen::Home(home()));
         if let Screen::Home(ref mut home) = app.screen {
             home.active_panel = PANEL_IMAGES;
         }
@@ -688,10 +682,7 @@ mod tests {
 
     #[test]
     fn a_bare_c_is_a_name_character() {
-        let mut app = App {
-            screen: Screen::Home(home()),
-            exit: false,
-        };
+        let mut app = App::with_screen(Screen::Home(home()));
         if let Screen::Home(ref mut home) = app.screen {
             home.active_panel = PANEL_IMAGES;
         }
@@ -707,10 +698,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_cancels_the_dialog_and_discards_the_name() {
-        let mut app = App {
-            screen: Screen::Home(home()),
-            exit: false,
-        };
+        let mut app = App::with_screen(Screen::Home(home()));
         if let Screen::Home(ref mut home) = app.screen {
             home.active_panel = PANEL_IMAGES;
         }
@@ -732,10 +720,7 @@ mod tests {
 
     #[test]
     fn enter_on_an_empty_name_keeps_the_dialog_open() {
-        let mut app = App {
-            screen: Screen::Home(home()),
-            exit: false,
-        };
+        let mut app = App::with_screen(Screen::Home(home()));
         if let Screen::Home(ref mut home) = app.screen {
             home.active_panel = PANEL_IMAGES;
         }
@@ -747,10 +732,7 @@ mod tests {
 
     #[test]
     fn esc_closes_the_help_panel_before_leaving_the_screen() {
-        let mut app = App {
-            screen: Screen::Home(home()),
-            exit: false,
-        };
+        let mut app = App::with_screen(Screen::Home(home()));
 
         HomeScreen::toggle_help(&mut app);
         assert!(matches!(app.screen, Screen::Home(ref h) if h.show_help));
