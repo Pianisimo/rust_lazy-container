@@ -1,20 +1,28 @@
 pub(crate) mod container_list_panel;
 pub(crate) mod help_panel;
 pub(crate) mod images_list_panel;
-pub(crate) mod table;
 
-use container_list_panel::{ContainerEntry, ContainerFilter, fetch_containers};
-use images_list_panel::{ImageEntry, fetch_images};
+use std::time::Instant;
 
-use crate::screens::{App, Screen, StatusScreen, run_command};
+use container_list_panel::ContainerFilter;
+pub(crate) use container_list_panel::{ContainerEntry, fetch_containers};
+pub(crate) use images_list_panel::{
+    DEFAULT_REGISTRY_DOMAIN, ImageEntry, fetch_images, fetch_registry_domain,
+};
+
+use crate::screens::actions::{Action, PendingActions};
+use crate::screens::{App, Screen, StatusScreen};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
-    symbols::border,
+    symbols::{border, line},
     text::{Line, Span, Text},
-    widgets::{Block, Clear, Widget},
+    widgets::{
+        Block, Cell, Clear, HighlightSpacing, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        StatefulWidget, Table, TableState, Widget,
+    },
 };
 
 const PANEL_CONTAINERS: usize = 0;
@@ -25,6 +33,26 @@ const CREATE_DIALOG_WIDTH: u16 = 54;
 
 /// Longest container name the dialog accepts.
 const CREATE_NAME_LIMIT: usize = 40;
+
+/// Marks the cursor row. Every row is indented by its width, selected or
+/// not, so the columns don't shift.
+const HIGHLIGHT_SYMBOL: &str = " > ";
+
+/// Blank columns between two cells.
+const COLUMN_SPACING: u16 = 1;
+
+/// Rows the column titles take at the top of a list.
+const HEADER_HEIGHT: u16 = 1;
+
+// Column widths. The name columns grow to fit their longest entry; the last
+// column of each list takes whatever is left.
+const CONTAINER_NAME_WIDTH: u16 = 15;
+/// "running" and "stopping…", plus one more column before the IP.
+const CONTAINER_STATE_WIDTH: u16 = 11;
+/// The longest name among the usual images: `ghcr.io/apple/containerization/vminit`.
+const IMAGE_NAME_WIDTH: u16 = 37;
+const IMAGE_TAG_WIDTH: u16 = 7;
+const IMAGE_DIGEST_WIDTH: u16 = 12;
 
 /// Centres a `width` x `height` box inside `area`, shrinking to fit.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -38,48 +66,181 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// One containers-panel row. The header uses it too, so the column widths
-/// cannot drift apart.
-fn container_row(prefix: &str, id: &str, state: &str, addr: &str) -> String {
-    format!("{prefix}{id:<15} {state:<10}  {addr}")
+/// Wide enough for `min` columns and for the widest of `cells`.
+fn column_width<'a>(min: u16, cells: impl Iterator<Item = &'a str>) -> u16 {
+    let widest = cells.map(|cell| Span::raw(cell).width()).max().unwrap_or(0);
+    widest.clamp(min as usize, u16::MAX as usize) as u16
 }
 
-/// One images-panel row. Widths add up to 76: the panel's inner width at 80
-/// columns, with the longest image name (37) and digest (12) in place.
-fn image_row(prefix: &str, name: &str, tag: &str, digest: &str, platform: &str) -> String {
-    format!("{prefix}{name:<38}{tag:<8}{digest:<13}{platform}")
+/// Constraints for columns that want `widths`, in a table `available` cells
+/// wide. Each column gets what it wants, left to right, and the last one
+/// takes whatever is left. Past the edge, the column there is cut short and
+/// the rest are dropped, the way the panel border clips plain text. Handing
+/// ratatui only widths that fit also keeps its layout solver from shrinking
+/// every column at once when the help panel narrows the lists.
+fn fit_columns(widths: &[u16], available: u16) -> Vec<Constraint> {
+    let mut constraints = Vec::with_capacity(widths.len());
+    let mut used: u16 = 0;
+    for (index, &wanted) in widths.iter().enumerate() {
+        let gap = if index == 0 { 0 } else { COLUMN_SPACING };
+        let room = available.saturating_sub(used.saturating_add(gap));
+        if room == 0 {
+            break;
+        }
+        let width = if index + 1 == widths.len() {
+            room
+        } else {
+            wanted.min(room)
+        };
+        constraints.push(Constraint::Length(width));
+        used = used.saturating_add(gap + width);
+    }
+    constraints
 }
 
-/// Column titles for a list panel, dimmed so they read as a ruler rather than
-/// as another row.
-fn header_line(text: String) -> Line<'static> {
-    Line::from(text.trim_end().to_string()).dark_gray().bold()
+/// The first row to show so that row `selected` of `len` is among the
+/// `height` on screen, moving the view as little as possible from `offset`.
+fn scroll_offset(offset: usize, selected: usize, len: usize, height: usize) -> usize {
+    if height == 0 {
+        return offset;
+    }
+    let last_offset = len.saturating_sub(height);
+    let offset = offset.min(last_offset);
+    let offset = if selected < offset {
+        selected
+    } else if selected >= offset + height {
+        selected + 1 - height
+    } else {
+        offset
+    };
+    offset.min(last_offset)
+}
+
+fn border_style(is_active: bool) -> Style {
+    if is_active {
+        Style::new().cyan()
+    } else {
+        Style::new().dark_gray()
+    }
+}
+
+/// The rows of a list panel drawn at `area`: inside its border, under the
+/// column titles.
+fn list_rows_area(area: Rect) -> Rect {
+    let inner = Block::bordered().inner(area);
+    let header = HEADER_HEIGHT.min(inner.height);
+    Rect {
+        y: inner.y + header,
+        height: inner.height - header,
+        ..inner
+    }
+}
+
+/// One list panel, ready to draw with `HomeScreen::render_list`.
+struct ListPanel<'a> {
+    /// `PANEL_CONTAINERS` or `PANEL_IMAGES`.
+    index: usize,
+    block: Block<'a>,
+    header: Row<'a>,
+    rows: Vec<Row<'a>>,
+    /// The width each column asks for; see `fit_columns`.
+    widths: Vec<u16>,
+}
+
+/// Where each part of the home screen goes.
+struct Areas {
+    containers: Rect,
+    images: Rect,
+    help: Option<Rect>,
+}
+
+/// The open create-container dialog.
+#[derive(Debug)]
+struct CreateDialog {
+    /// The name typed so far.
+    name: String,
+    /// The image to create from. Copied when the dialog opens, so a refresh
+    /// that moves the images cursor can't change it while the user types.
+    image: ImageEntry,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct HomeScreen {
     active_panel: usize,
     selected_rows: [usize; 2],
+    /// The first row each list shows. `render` only gets `&self`, so the
+    /// offsets live here, and `keep_selection_visible` moves them before each
+    /// draw, once the frame size is known.
+    scroll_offsets: [usize; 2],
     containers: Vec<ContainerEntry>,
     container_filter: ContainerFilter,
     images: Vec<ImageEntry>,
     show_help: bool,
-    /// The name being typed in the create-container dialog. `Some` while the
-    /// dialog is open, which makes it modal: it swallows every key.
-    create_input: Option<String>,
+    /// `Some` while the create-container dialog is open, which makes it
+    /// modal: it swallows every key.
+    create_dialog: Option<CreateDialog>,
+    /// A container created from the dialog. The cursor moves to it once a
+    /// refresh lists it.
+    awaited_container: Option<String>,
 }
 
 impl HomeScreen {
-    pub(crate) fn fetch() -> Self {
-        Self {
-            active_panel: 0,
-            selected_rows: [0, 0],
-            containers: fetch_containers(),
-            container_filter: ContainerFilter::default(),
-            images: fetch_images(),
-            show_help: false,
-            create_input: None,
+    /// An empty screen; the worker fills in the lists.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes fresh copies of both lists and keeps each cursor on the item it
+    /// was on. A list that couldn't be read keeps its old rows, and the
+    /// reason is handed back for the app to show.
+    pub(crate) fn update(
+        &mut self,
+        containers: Result<Vec<ContainerEntry>, String>,
+        images: Result<Vec<ImageEntry>, String>,
+    ) -> Option<String> {
+        let mut errors = Vec::new();
+        match containers {
+            Ok(containers) => self.set_containers(containers),
+            Err(e) => errors.push(e),
         }
+        match images {
+            Ok(images) => self.set_images(images),
+            Err(e) => errors.push(e),
+        }
+        errors.dedup();
+        (!errors.is_empty()).then(|| errors.join("\n"))
+    }
+
+    fn set_containers(&mut self, containers: Vec<ContainerEntry>) {
+        let row = self.selected_rows[PANEL_CONTAINERS];
+        let current = self.cursor_container().map(|c| c.id.clone());
+        self.containers = containers;
+
+        let created = self
+            .awaited_container
+            .take_if(|name| self.containers.iter().any(|c| c.id == *name));
+        match created {
+            Some(name) => self.reselect_container(&name),
+            // If the container is gone, the cursor stays on the same row
+            // instead of jumping to the top.
+            None => self.select_container_or(current.as_deref(), row),
+        }
+    }
+
+    fn set_images(&mut self, images: Vec<ImageEntry>) {
+        let row = self.selected_rows[PANEL_IMAGES];
+        let current = self.images.get(row).map(|i| i.reference.clone());
+        self.images = images;
+
+        let row = current
+            .and_then(|reference| self.images.iter().position(|i| i.reference == reference))
+            .unwrap_or(row);
+        self.selected_rows[PANEL_IMAGES] = row.min(self.images.len().saturating_sub(1));
+    }
+
+    /// Moves the cursor to container `name` as soon as a refresh lists it.
+    pub(crate) fn select_when_listed(&mut self, name: String) {
+        self.awaited_container = Some(name);
     }
 
     /// The image container-creation acts on: the one under the cursor, and only
@@ -95,66 +256,56 @@ impl HomeScreen {
     /// `c` — open the create-container dialog for the selected image.
     pub(crate) fn open_create_dialog(app: &mut App) {
         if let Screen::Home(ref mut home) = app.screen
-            && home.focused_image().is_some()
+            && let Some(image) = home.focused_image().cloned()
         {
-            home.create_input = Some(String::new());
+            home.create_dialog = Some(CreateDialog {
+                name: String::new(),
+                image,
+            });
         }
     }
 
     /// While the dialog is open it owns every key, so `q` does not quit and the
     /// arrows do not move the lists underneath. Returns whether it consumed one.
     pub(crate) fn handle_dialog_key(app: &mut App, key: KeyEvent) -> bool {
-        let home = match app.screen {
-            Screen::Home(ref mut home) if home.create_input.is_some() => home,
-            _ => return false,
+        let Screen::Home(home) = &mut app.screen else {
+            return false;
+        };
+        let Some(dialog) = home.create_dialog.as_mut() else {
+            return false;
         };
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
-            KeyCode::Enter => home.confirm_create(),
-            // Cancel is Ctrl+C so a bare `c` stays available for the name.
-            KeyCode::Char('c') if ctrl => home.create_input = None,
-            KeyCode::Esc => home.create_input = None,
-            KeyCode::Backspace => {
-                if let Some(name) = home.create_input.as_mut() {
-                    name.pop();
+            KeyCode::Enter => {
+                // An empty name is not a valid one, so Enter simply keeps waiting.
+                let name = dialog.name.trim().to_string();
+                if name.is_empty() {
+                    return true;
                 }
+                let image = dialog.image.reference.clone();
+                home.create_dialog = None;
+                app.submit(Action::CreateContainer { name, image });
             }
-            KeyCode::Char(ch) if !ctrl => {
-                if let Some(name) = home.create_input.as_mut()
-                    // Anything the CLI would reject as a name is dropped.
+            // Cancel is Ctrl+C so a bare `c` stays available for the name.
+            KeyCode::Char('c') if ctrl => home.create_dialog = None,
+            KeyCode::Esc => home.create_dialog = None,
+            KeyCode::Backspace => {
+                dialog.name.pop();
+            }
+            // Anything the CLI would reject as a name is dropped.
+            KeyCode::Char(ch)
+                if !ctrl
                     && (ch.is_alphanumeric() || "-_.".contains(ch))
-                    && name.chars().count() < CREATE_NAME_LIMIT
-                {
-                    name.push(ch);
-                }
+                    && dialog.name.chars().count() < CREATE_NAME_LIMIT =>
+            {
+                dialog.name.push(ch);
             }
             _ => {}
         }
 
         true
-    }
-
-    /// Creates the container and closes the dialog. An empty name is not a
-    /// valid one, so Enter simply keeps waiting.
-    fn confirm_create(&mut self) {
-        let name = self
-            .create_input
-            .clone()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if name.is_empty() {
-            return;
-        }
-
-        if let Some(image) = self.focused_image().map(|i| i.reference()) {
-            run_command(&["container", "create", "--name", &name, &image]);
-            self.containers = fetch_containers();
-            self.reselect_container(&name);
-        }
-        self.create_input = None;
     }
 
     /// `/` — show or hide the help panel.
@@ -164,8 +315,9 @@ impl HomeScreen {
         }
     }
 
-    /// The containers the current filter lets through. `fetch_containers` always
-    /// pulls `ls -a`, so cycling the filter never needs another subprocess.
+    /// The containers the current filter lets through. The worker always
+    /// lists every container, so cycling the filter never needs another
+    /// subprocess.
     fn visible_containers(&self) -> Vec<&ContainerEntry> {
         self.containers
             .iter()
@@ -190,18 +342,22 @@ impl HomeScreen {
         }
     }
 
-    /// Puts the cursor back on `id`, falling back to the first row when the
-    /// current filter no longer shows it.
-    fn reselect_container(&mut self, id: &str) {
+    /// Puts the cursor on `id` if the filter shows it, and otherwise on row
+    /// `fallback`, or the last row if there are fewer.
+    fn select_container_or(&mut self, id: Option<&str>, fallback: usize) {
         let row = {
             let visible = self.visible_containers();
-            visible
-                .iter()
-                .position(|c| c.id == id)
-                .unwrap_or(0)
+            id.and_then(|id| visible.iter().position(|c| c.id == id))
+                .unwrap_or(fallback)
                 .min(visible.len().saturating_sub(1))
         };
         self.selected_rows[PANEL_CONTAINERS] = row;
+    }
+
+    /// Puts the cursor back on `id`, falling back to the first row when the
+    /// current filter no longer shows it.
+    fn reselect_container(&mut self, id: &str) {
+        self.select_container_or(Some(id), 0);
     }
 
     /// `.` — cycle the container panel between all and running-only.
@@ -227,22 +383,24 @@ impl HomeScreen {
             .map(|c| if c.is_running() { "stop" } else { "start" })
     }
 
-    /// `s` — start the selected container, or stop it if it is already running.
+    /// `s` — start the selected container, or stop it if it is already
+    /// running. The command runs in the background; the list shows the
+    /// result once a refresh sees it.
     pub(crate) fn handle_start_stop_container(app: &mut App) {
-        if let Screen::Home(ref mut home) = app.screen {
-            let (id, running) = match home.focused_container() {
-                Some(c) => (c.id.clone(), c.is_running()),
-                None => return,
-            };
+        let Screen::Home(home) = &app.screen else {
+            return;
+        };
+        let Some(container) = home.focused_container() else {
+            return;
+        };
 
-            if running {
-                run_command(&["container", "stop", &id]);
-            } else {
-                run_command(&["container", "start", &id]);
-            }
-            home.containers = fetch_containers();
-            home.reselect_container(&id);
-        }
+        let id = container.id.clone();
+        let action = if container.is_running() {
+            Action::StopContainer(id)
+        } else {
+            Action::StartContainer(id)
+        };
+        app.submit(action);
     }
 
     pub(crate) fn handle_esc(app: &mut App) {
@@ -250,29 +408,28 @@ impl HomeScreen {
             // Esc dismisses the help panel before it leaves the screen.
             Screen::Home(ref mut home) if home.show_help => home.show_help = false,
             Screen::Home(_) => {
-                let mut status = StatusScreen::fetch();
                 // The user asked for the status screen; auto-navigation would
                 // immediately drag them back here.
-                status.auto_navigate = false;
-                app.screen = Screen::Status(status);
+                let status = StatusScreen::new(app.version.clone(), false);
+                app.show(Screen::Status(status));
             }
             Screen::Status(_) => {}
         }
     }
 
     pub(crate) fn handle_shift_up(app: &mut App) {
-        if let Screen::Home(ref mut home) = app.screen {
-            if home.active_panel > 0 {
-                home.active_panel -= 1;
-            }
+        if let Screen::Home(ref mut home) = app.screen
+            && home.active_panel > 0
+        {
+            home.active_panel -= 1;
         }
     }
 
     pub(crate) fn handle_shift_down(app: &mut App) {
-        if let Screen::Home(ref mut home) = app.screen {
-            if home.active_panel < 1 {
-                home.active_panel += 1;
-            }
+        if let Screen::Home(ref mut home) = app.screen
+            && home.active_panel < 1
+        {
+            home.active_panel += 1;
         }
     }
 
@@ -296,6 +453,25 @@ impl HomeScreen {
             if max > 0 && *row < max - 1 {
                 *row += 1;
             }
+        }
+    }
+
+    /// Scrolls each list just enough to keep its cursor on screen. Called
+    /// before every draw, since only then is it known how many rows fit.
+    pub(crate) fn keep_selection_visible(&mut self, area: Rect) {
+        let areas = self.areas(area);
+        let lengths = [self.visible_containers().len(), self.images.len()];
+        for (panel, panel_area) in [
+            (PANEL_CONTAINERS, areas.containers),
+            (PANEL_IMAGES, areas.images),
+        ] {
+            let height = list_rows_area(panel_area).height as usize;
+            self.scroll_offsets[panel] = scroll_offset(
+                self.scroll_offsets[panel],
+                self.selected_rows[panel],
+                lengths[panel],
+                height,
+            );
         }
     }
 
@@ -342,150 +518,219 @@ impl HomeScreen {
         hints
     }
 
-    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
-        let instructions = Line::from(self.footer_hints());
-
-        let outer_block = Block::bordered()
-            .title(Line::from(" lazy-container ").bold().centered())
-            .title_bottom(instructions.centered())
-            .border_set(border::THICK);
-
-        let inner = outer_block.inner(area);
-        outer_block.render(area, buf);
+    /// Splits the screen. `render` and `keep_selection_visible` both use
+    /// this, so the scroll offsets are worked out for the rows that are drawn.
+    fn areas(&self, area: Rect) -> Areas {
+        let inner = Block::bordered().inner(area);
 
         // The help panel claims the full height of the right-hand side and
         // squeezes the lists rather than overlaying them.
-        let body = if self.show_help {
-            let [body, help_area] =
+        let (body, help) = if self.show_help {
+            let [body, help] =
                 Layout::horizontal([Constraint::Min(0), Constraint::Max(help_panel::WIDTH)])
                     .areas(inner);
-            help_panel::render(help_area, buf);
-            body
+            (body, Some(help))
         } else {
-            inner
+            (inner, None)
         };
 
-        let [top_area, bottom_area] =
+        let [containers, images] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
 
-        self.render_containers(top_area, buf);
-        self.render_images(bottom_area, buf);
-
-        // Drawn last so it sits over everything else.
-        if let Some(name) = &self.create_input {
-            self.render_create_dialog(name, area, buf);
+        Areas {
+            containers,
+            images,
+            help,
         }
     }
 
-    fn render_create_dialog(&self, name: &str, area: Rect, buf: &mut Buffer) {
-        let image = self
-            .focused_image()
-            .map(|i| i.reference())
-            .unwrap_or_default();
+    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, pending: &PendingActions) {
+        let instructions = Line::from(self.footer_hints());
 
-        let popup = centered(area, CREATE_DIALOG_WIDTH, 4);
-        Clear.render(popup, buf);
+        Block::bordered()
+            .title(Line::from(" lazy-container ").bold().centered())
+            .title_bottom(instructions.centered())
+            .border_set(border::THICK)
+            .render(area, buf);
 
-        let block = Block::bordered()
-            .title(Line::from(" New container ").bold())
-            .title_bottom(
-                Line::from(vec![
-                    " Enter".blue().bold(),
-                    ": create  ".dark_gray(),
-                    "Ctrl+C".blue().bold(),
-                    ": cancel ".dark_gray(),
-                ])
-                .centered(),
-            )
-            .border_style(Style::new().cyan());
+        let areas = self.areas(area);
+        if let Some(help_area) = areas.help {
+            help_panel::render(help_area, buf);
+        }
+        self.render_containers(areas.containers, buf, pending);
+        self.render_images(areas.images, buf);
 
-        let inner = block.inner(popup);
-        block.render(popup, buf);
-
-        Text::from(vec![
-            Line::from(format!(" from {image}")).dark_gray(),
-            // A block for the caret, since the terminal's own cursor is hidden.
-            Line::from(format!(" {name}█")).bold(),
-        ])
-        .render(inner, buf);
+        // Drawn last so it sits over everything else.
+        if let Some(dialog) = &self.create_dialog {
+            render_create_dialog(dialog, area, buf);
+        }
     }
 
-    fn render_containers(&self, area: Rect, buf: &mut Buffer) {
+    fn render_containers(&self, area: Rect, buf: &mut Buffer, pending: &PendingActions) {
         let is_active = self.active_panel == PANEL_CONTAINERS;
-        let selected = self.selected_rows[PANEL_CONTAINERS];
+        let title = Line::from(format!(" Containers ({}) ", self.container_filter.label())).bold();
 
-        let block = Block::bordered()
-            .title(Line::from(format!(" Containers ({}) ", self.container_filter.label())).bold())
-            .border_style(if is_active {
-                Style::new().cyan()
-            } else {
-                Style::new().dark_gray()
-            });
+        // What is running goes on the same border, right-aligned, in the
+        // room the title leaves: two corners, a gap, and a space either side.
+        let room = (area.width as usize).saturating_sub(title.width() + 5);
+        let progress = pending
+            .progress(Instant::now(), room)
+            .map(|progress| Line::from(format!(" {progress} ")).yellow().right_aligned());
 
-        let inner = block.inner(area);
-        block.render(area, buf);
+        let mut block = Block::bordered()
+            .title(title)
+            .border_style(border_style(is_active));
+        if let Some(progress) = progress {
+            block = block.title(progress);
+        }
 
-        let mut lines: Vec<Line> = vec![header_line(container_row("   ", "NAME", "STATE", "IP"))];
+        let containers = self.visible_containers();
+        let widths = vec![
+            column_width(
+                CONTAINER_NAME_WIDTH,
+                containers.iter().map(|c| c.id.as_str()),
+            ),
+            CONTAINER_STATE_WIDTH,
+            0,
+        ];
+        let rows = containers
+            .iter()
+            .map(|c| {
+                // A container being started or stopped says so.
+                let state = pending.row_state(&c.id).unwrap_or(&c.state);
+                let row = Row::new([c.id.as_str(), state, c.addr.as_str()]);
+                if c.is_running() { row } else { row.dark_gray() }
+            })
+            .collect();
 
-        lines.extend(self.visible_containers().iter().enumerate().map(|(i, c)| {
-            let prefix = if i == selected && is_active {
-                " > "
-            } else {
-                "   "
-            };
-            let text = container_row(prefix, &c.id, &c.state, &c.addr);
-            if i == selected && is_active {
-                Line::from(text).yellow().bold()
-            } else if c.is_running() {
-                Line::from(text)
-            } else {
-                Line::from(text).dark_gray()
-            }
-        }));
-
-        ratatui::text::Text::from(lines).render(inner, buf);
+        let list = ListPanel {
+            index: PANEL_CONTAINERS,
+            block,
+            header: Row::new(["NAME", "STATE", "IP"]),
+            rows,
+            widths,
+        };
+        self.render_list(list, area, buf);
     }
 
     fn render_images(&self, area: Rect, buf: &mut Buffer) {
         let is_active = self.active_panel == PANEL_IMAGES;
-        let selected = self.selected_rows[PANEL_IMAGES];
-
         let block = Block::bordered()
             .title(Line::from(" Images ").bold())
-            .border_style(if is_active {
-                Style::new().cyan()
-            } else {
-                Style::new().dark_gray()
-            });
+            .border_style(border_style(is_active));
 
-        let inner = block.inner(area);
-        block.render(area, buf);
+        let widths = vec![
+            column_width(
+                IMAGE_NAME_WIDTH,
+                self.images.iter().map(|i| i.name.as_str()),
+            ),
+            column_width(IMAGE_TAG_WIDTH, self.images.iter().map(|i| i.tag.as_str())),
+            IMAGE_DIGEST_WIDTH,
+            0,
+        ];
+        let rows = self
+            .images
+            .iter()
+            .map(|image| {
+                Row::new([
+                    Cell::from(image.name.as_str()),
+                    Cell::from(image.tag.as_str()),
+                    Cell::from(image.digest.as_str()),
+                    Cell::from(image.platform()),
+                ])
+            })
+            .collect();
 
-        let mut lines: Vec<Line> = vec![header_line(image_row(
-            "   ", "NAME", "TAG", "DIGEST", "PLATFORM",
-        ))];
-
-        lines.extend(self.images.iter().enumerate().map(|(i, img)| {
-            let prefix = if i == selected && is_active {
-                " > "
-            } else {
-                "   "
-            };
-            let text = image_row(prefix, &img.name, &img.tag, &img.digest, &img.platform());
-            if i == selected && is_active {
-                Line::from(text).yellow().bold()
-            } else {
-                Line::from(text)
-            }
-        }));
-
-        ratatui::text::Text::from(lines).render(inner, buf);
+        let list = ListPanel {
+            index: PANEL_IMAGES,
+            block,
+            header: Row::new(["NAME", "TAG", "DIGEST", "PLATFORM"]),
+            rows,
+            widths,
+        };
+        self.render_list(list, area, buf);
     }
+
+    /// Draws a list panel: column titles, then as many rows as fit from the
+    /// panel's scroll offset on. The cursor row is highlighted only while the
+    /// panel has focus. When the rows don't all fit, a scrollbar on the right
+    /// border shows where the view is.
+    fn render_list(&self, list: ListPanel, area: Rect, buf: &mut Buffer) {
+        let is_active = self.active_panel == list.index;
+        let offset = self.scroll_offsets[list.index];
+        let row_count = list.rows.len();
+
+        let inner = list.block.inner(area);
+        list.block.render(area, buf);
+
+        let highlight_width = Span::raw(HIGHLIGHT_SYMBOL).width() as u16;
+        let widths = fit_columns(&list.widths, inner.width.saturating_sub(highlight_width));
+        let table = Table::new(list.rows, widths)
+            .header(list.header.dark_gray().bold())
+            .column_spacing(COLUMN_SPACING)
+            .highlight_symbol(HIGHLIGHT_SYMBOL)
+            .highlight_spacing(HighlightSpacing::Always)
+            .row_highlight_style(Style::new().yellow().bold());
+        let mut state = TableState::new()
+            .with_offset(offset)
+            .with_selected(is_active.then_some(self.selected_rows[list.index]));
+        StatefulWidget::render(table, inner, buf, &mut state);
+
+        let rows_area = list_rows_area(area);
+        let visible = rows_area.height as usize;
+        if visible > 0 && row_count > visible {
+            let mut position = ScrollbarState::new(row_count - visible + 1)
+                .position(offset)
+                .viewport_content_length(visible);
+            // Over the right border, level with the rows.
+            let track = Rect {
+                x: area.x,
+                width: area.width,
+                ..rows_area
+            };
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some(line::VERTICAL))
+                .thumb_symbol(line::THICK_VERTICAL)
+                .style(border_style(is_active))
+                .render(track, buf, &mut position);
+        }
+    }
+}
+
+fn render_create_dialog(dialog: &CreateDialog, area: Rect, buf: &mut Buffer) {
+    let popup = centered(area, CREATE_DIALOG_WIDTH, 4);
+    Clear.render(popup, buf);
+
+    let block = Block::bordered()
+        .title(Line::from(" New container ").bold())
+        .title_bottom(
+            Line::from(vec![
+                " Enter".blue().bold(),
+                ": create  ".dark_gray(),
+                "Ctrl+C".blue().bold(),
+                ": cancel ".dark_gray(),
+            ])
+            .centered(),
+        )
+        .border_style(Style::new().cyan());
+
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+
+    Text::from(vec![
+        Line::from(format!(" from {}", dialog.image.label())).dark_gray(),
+        // A block for the caret, since the terminal's own cursor is hidden.
+        Line::from(format!(" {}█", dialog.name)).bold(),
+    ])
+    .render(inner, buf);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::screens::worker::{Refresh, RefreshKind, Reply};
 
     fn entry(id: &str, state: &str) -> ContainerEntry {
         ContainerEntry {
@@ -495,56 +740,381 @@ mod tests {
         }
     }
 
+    fn image(name: &str, tag: &str) -> ImageEntry {
+        ImageEntry {
+            reference: format!("docker.io/library/{name}:{tag}"),
+            name: name.to_string(),
+            tag: tag.to_string(),
+            digest: "78481659c47e".to_string(),
+            platforms: vec!["linux/arm64".to_string()],
+        }
+    }
+
     fn home() -> HomeScreen {
         HomeScreen {
-            active_panel: PANEL_CONTAINERS,
-            selected_rows: [0, 0],
             containers: vec![
                 entry("alpha", "stopped"),
                 entry("bravo", "running"),
                 entry("charlie", "stopped"),
             ],
-            container_filter: ContainerFilter::All,
-            images: vec![ImageEntry {
-                name: "docker.io/library/postgres".to_string(),
-                tag: "latest".to_string(),
-                digest: "78481659c47e".to_string(),
-                platforms: vec!["linux/arm64".to_string()],
-            }],
-            show_help: false,
-            create_input: None,
+            images: vec![image("postgres", "latest")],
+            ..HomeScreen::default()
         }
     }
 
-    /// The column a title sits in, so a header can be checked against a row.
-    fn offsets(line: &str) -> Vec<usize> {
-        line.match_indices(|c: char| !c.is_whitespace())
-            .filter(|(i, _)| *i == 0 || line.as_bytes()[i - 1] == b' ')
-            .map(|(i, _)| i)
+    fn many_containers(count: usize) -> Vec<ContainerEntry> {
+        (0..count)
+            .map(|n| entry(&format!("container-{n:02}"), "running"))
             .collect()
     }
 
-    #[test]
-    fn container_headers_line_up_with_their_rows() {
-        let header = container_row("   ", "NAME", "STATE", "IP");
-        let row = container_row("   ", "bravo", "running", "192.168.64.3");
-        assert_eq!(offsets(&header), offsets(&row));
+    fn app_with(screen: HomeScreen) -> App {
+        App::with_screen(Screen::Home(screen))
+    }
+
+    fn home_of(app: &App) -> &HomeScreen {
+        match &app.screen {
+            Screen::Home(home) => home,
+            Screen::Status(_) => panic!("expected the home screen"),
+        }
+    }
+
+    fn home_mut(app: &mut App) -> &mut HomeScreen {
+        match &mut app.screen {
+            Screen::Home(home) => home,
+            Screen::Status(_) => panic!("expected the home screen"),
+        }
+    }
+
+    impl HomeScreen {
+        fn dialog_name(&self) -> Option<&str> {
+            self.create_dialog.as_ref().map(|d| d.name.as_str())
+        }
+    }
+
+    /// The screen as text, one string per row, after the same scroll update
+    /// the app does before drawing.
+    fn draw(
+        screen: &mut HomeScreen,
+        pending: &PendingActions,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        screen.keep_selection_visible(area);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, pending);
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn row_containing<'a>(rows: &'a [String], text: &str) -> Option<&'a String> {
+        rows.iter().find(|row| row.contains(text))
     }
 
     #[test]
-    fn image_headers_line_up_with_their_rows() {
-        let header = image_row("   ", "NAME", "TAG", "DIGEST", "PLATFORM");
-        let row = image_row("   ", "alpine", "edge", "020dfcbaaf4c", "linux/arm64 +6");
-        // The platform cell is the only one with an internal space.
-        assert_eq!(offsets(&header), offsets(&row)[..offsets(&header).len()]);
-    }
+    fn container_columns_keep_their_layout() {
+        let mut screen = home();
+        screen.containers[1].addr = "192.168.64.3/24".to_string();
+        screen.active_panel = PANEL_IMAGES;
+        let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
 
-    #[test]
-    fn a_container_with_no_address_leaves_no_trailing_padding() {
+        // Rows 2 and 4 of the screen: the header and bravo, inside the borders.
         assert_eq!(
-            container_row("   ", "alpha", "stopped", "").trim_end(),
-            "   alpha           stopped"
+            rows[2][6..].trim_end_matches([' ', '│', '┃']),
+            "   NAME            STATE       IP"
         );
+        assert_eq!(
+            rows[4][6..].trim_end_matches([' ', '│', '┃']),
+            "   bravo           running     192.168.64.3/24"
+        );
+    }
+
+    #[test]
+    fn image_columns_keep_their_layout() {
+        let mut screen = home();
+        screen.images = vec![ImageEntry {
+            platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
+            ..image("alpine", "edge")
+        }];
+        let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
+
+        let header = row_containing(&rows, "PLATFORM").unwrap();
+        assert_eq!(
+            header[6..].trim_end_matches([' ', '│', '┃']),
+            "   NAME                                  TAG     DIGEST       PLATFORM"
+        );
+        let row = row_containing(&rows, "alpine").unwrap();
+        assert!(
+            row[6..].starts_with(
+                "   alpine                                edge    78481659c47e linux/"
+            ),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn a_long_name_widens_its_column_for_every_row() {
+        let mut screen = home();
+        screen.containers[0].id = "a-very-long-container-name".to_string();
+        let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
+
+        let header = row_containing(&rows, "NAME").unwrap();
+        let bravo = row_containing(&rows, "bravo").unwrap();
+        let long = row_containing(&rows, "a-very-long-container-name").unwrap();
+        let state_column = header.find("STATE").unwrap();
+        assert_eq!(bravo.find("running"), Some(state_column));
+        assert_eq!(long.find("stopped"), Some(state_column));
+    }
+
+    #[test]
+    fn fit_columns_clips_at_the_edge_like_plain_text() {
+        assert_eq!(
+            fit_columns(&[37, 7, 12, 0], 73),
+            [
+                Constraint::Length(37),
+                Constraint::Length(7),
+                Constraint::Length(12),
+                Constraint::Length(14),
+            ]
+        );
+        // The help panel leaves 29 columns: the name is cut, the rest dropped.
+        assert_eq!(fit_columns(&[37, 7, 12, 0], 29), [Constraint::Length(29)]);
+        assert_eq!(
+            fit_columns(&[15, 11, 0], 29),
+            [
+                Constraint::Length(15),
+                Constraint::Length(11),
+                Constraint::Length(1),
+            ]
+        );
+        assert_eq!(fit_columns(&[15, 11, 0], 0), []);
+    }
+
+    #[test]
+    fn scrolling_moves_the_view_as_little_as_possible() {
+        // Moving down past the bottom scrolls by one row.
+        assert_eq!(scroll_offset(0, 7, 20, 8), 0);
+        assert_eq!(scroll_offset(0, 8, 20, 8), 1);
+        // Moving back up inside the view leaves it alone...
+        assert_eq!(scroll_offset(1, 7, 20, 8), 1);
+        assert_eq!(scroll_offset(1, 1, 20, 8), 1);
+        // ...until the cursor passes the top.
+        assert_eq!(scroll_offset(1, 0, 20, 8), 0);
+        // A list that shrank doesn't leave blank rows at the bottom.
+        assert_eq!(scroll_offset(12, 3, 5, 8), 0);
+        assert_eq!(scroll_offset(12, 15, 16, 8), 8);
+        // No rows fit: nothing to decide.
+        assert_eq!(scroll_offset(3, 9, 20, 0), 3);
+    }
+
+    #[test]
+    fn the_cursor_stays_on_screen_in_a_long_list() {
+        let mut app = app_with(HomeScreen {
+            containers: many_containers(20),
+            ..HomeScreen::default()
+        });
+        let no_pending = PendingActions::default();
+        for _ in 0..15 {
+            HomeScreen::move_down(&mut app);
+        }
+
+        // At 80×24 the containers panel shows 8 rows.
+        let rows = draw(home_mut(&mut app), &no_pending, 80, 24);
+        let cursor = row_containing(&rows, " > ").expect("cursor row on screen");
+        assert!(cursor.contains("container-15"), "{cursor}");
+        assert!(rows[10].contains(" > container-15"), "{}", rows[10]);
+        assert!(row_containing(&rows, "container-07").is_none());
+        // The column titles stay put above the scrolled rows.
+        assert!(rows[2].contains("NAME"));
+        assert!(rows[3].contains("container-08"), "{}", rows[3]);
+
+        // Back up to the top row of the view: nothing moves.
+        for _ in 0..7 {
+            HomeScreen::move_up(&mut app);
+        }
+        let rows = draw(home_mut(&mut app), &no_pending, 80, 24);
+        assert!(rows[3].contains(" > container-08"), "{}", rows[3]);
+
+        // One more and the view follows.
+        HomeScreen::move_up(&mut app);
+        let rows = draw(home_mut(&mut app), &no_pending, 80, 24);
+        assert!(rows[3].contains(" > container-07"), "{}", rows[3]);
+        assert!(rows[10].contains("container-14"), "{}", rows[10]);
+    }
+
+    #[test]
+    fn the_images_list_scrolls_too() {
+        let mut screen = HomeScreen {
+            images: (0..20)
+                .map(|n| image(&format!("image-{n:02}"), "1"))
+                .collect(),
+            active_panel: PANEL_IMAGES,
+            selected_rows: [0, 19],
+            ..HomeScreen::default()
+        };
+        let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
+        let cursor = row_containing(&rows, " > ").expect("cursor row on screen");
+        assert!(cursor.contains("image-19"), "{cursor}");
+    }
+
+    #[test]
+    fn a_scrollbar_appears_only_when_rows_are_hidden() {
+        let mut screen = home();
+        let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
+        assert!(rows[3..11].iter().all(|row| row.ends_with("│┃")));
+
+        let mut screen = HomeScreen {
+            containers: many_containers(20),
+            ..HomeScreen::default()
+        };
+        let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
+        // The thumb sits at the top of the rows, in the panel's right border.
+        let right_border: String = rows[3..11]
+            .iter()
+            .map(|row| row.chars().rev().nth(1).unwrap())
+            .collect();
+        assert_eq!(right_border, "┃┃┃│││││");
+    }
+
+    #[test]
+    fn a_running_command_shows_on_its_row_and_the_panel_border() {
+        let mut screen = home();
+        let mut pending = PendingActions::default();
+        pending.push(Action::StopContainer("bravo".to_string()));
+        let rows = draw(&mut screen, &pending, 80, 24);
+
+        // bravo is the second row; its STATE cell says what's happening.
+        assert!(rows[4].contains("bravo           stopping…"), "{}", rows[4]);
+        assert!(rows[1].contains("Containers (all)"), "{}", rows[1]);
+        // Right-aligned, after the spinner, whose frame depends on timing.
+        assert!(rows[1].ends_with(" Stopping bravo… ┐┃"), "{}", rows[1]);
+    }
+
+    #[test]
+    fn the_progress_never_covers_the_panel_title() {
+        let mut screen = home();
+        screen.show_help = true;
+        let mut pending = PendingActions::default();
+        pending.push(Action::StopContainer(
+            "a-container-with-a-long-name".to_string(),
+        ));
+        let rows = draw(&mut screen, &pending, 80, 24);
+        assert!(rows[1].contains(" Containers (all) "), "{}", rows[1]);
+        assert!(rows[1].contains("Stoppi"), "{}", rows[1]);
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_the_same_container() {
+        let mut screen = home();
+        screen.selected_rows[PANEL_CONTAINERS] = 1; // bravo
+
+        // A container created elsewhere sorts in front of bravo.
+        let error = screen.update(
+            Ok(vec![
+                entry("alpha", "stopped"),
+                entry("aardvark", "running"),
+                entry("bravo", "stopped"),
+            ]),
+            Ok(vec![image("postgres", "latest")]),
+        );
+        assert_eq!(error, None);
+        assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 2);
+        assert_eq!(
+            screen.cursor_container().map(|c| c.state.as_str()),
+            Some("stopped")
+        );
+    }
+
+    #[test]
+    fn a_vanished_container_leaves_the_cursor_on_its_row() {
+        let mut screen = home();
+        screen.selected_rows[PANEL_CONTAINERS] = 1; // bravo
+        screen.update(
+            Ok(vec![entry("alpha", "stopped"), entry("charlie", "stopped")]),
+            Ok(vec![]),
+        );
+        assert_eq!(
+            screen.cursor_container().map(|c| c.id.as_str()),
+            Some("charlie")
+        );
+
+        // With fewer rows than the cursor's, it stops at the last one.
+        screen.update(Ok(vec![entry("alpha", "stopped")]), Ok(vec![]));
+        assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 0);
+        screen.update(Ok(vec![]), Ok(vec![]));
+        assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 0);
+        assert!(screen.cursor_container().is_none());
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_the_same_image() {
+        let mut screen = home();
+        screen.images = vec![image("alpine", "edge"), image("postgres", "latest")];
+        screen.selected_rows[PANEL_IMAGES] = 1;
+
+        screen.update(
+            Ok(screen.containers.clone()),
+            Ok(vec![
+                image("alpine", "edge"),
+                image("nginx", "1"),
+                image("postgres", "latest"),
+            ]),
+        );
+        assert_eq!(screen.selected_rows[PANEL_IMAGES], 2);
+
+        // Deleted elsewhere: the cursor stays on its row, within the list.
+        screen.update(
+            Ok(screen.containers.clone()),
+            Ok(vec![image("alpine", "edge")]),
+        );
+        assert_eq!(screen.selected_rows[PANEL_IMAGES], 0);
+    }
+
+    #[test]
+    fn a_list_that_fails_to_load_keeps_its_rows() {
+        let mut screen = home();
+        let error = screen.update(Err("no answer".to_string()), Ok(vec![]));
+        assert_eq!(error.as_deref(), Some("no answer"));
+        assert_eq!(screen.containers.len(), 3);
+        assert!(screen.images.is_empty());
+
+        // The same failure twice is reported once.
+        let error = screen.update(Err("down".to_string()), Err("down".to_string()));
+        assert_eq!(error.as_deref(), Some("down"));
+    }
+
+    #[test]
+    fn a_created_container_takes_the_cursor_once_listed() {
+        let mut screen = home();
+        screen.select_when_listed("delta".to_string());
+
+        // Not there yet: nothing moves.
+        screen.update(Ok(home().containers), Ok(vec![]));
+        assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 0);
+
+        let mut containers = home().containers;
+        containers.push(entry("delta", "stopped"));
+        screen.update(Ok(containers.clone()), Ok(vec![]));
+        assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 3);
+
+        // Only once: later refreshes follow the cursor again.
+        screen.selected_rows[PANEL_CONTAINERS] = 1;
+        screen.update(Ok(containers), Ok(vec![]));
+        assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 1);
+    }
+
+    #[test]
+    fn container_headers_stay_even_with_no_rows() {
+        let mut screen = HomeScreen::new();
+        let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
+        assert!(
+            rows[2].contains("NAME            STATE       IP"),
+            "{}",
+            rows[2]
+        );
+        assert!(rows[3].trim_matches([' ', '│', '┃']).is_empty());
     }
 
     #[test]
@@ -623,32 +1193,28 @@ mod tests {
 
         screen.active_panel = PANEL_IMAGES;
         assert_eq!(
-            screen.focused_image().map(|i| i.reference()),
-            Some("docker.io/library/postgres:latest".to_string())
+            screen.focused_image().map(|i| i.reference.as_str()),
+            Some("docker.io/library/postgres:latest")
         );
     }
 
     #[test]
     fn the_dialog_only_opens_over_a_selected_image() {
-        let mut app = App::with_screen(Screen::Home(home()));
+        let mut app = app_with(home());
 
         // Containers panel has focus, so there is nothing to create from.
         HomeScreen::open_create_dialog(&mut app);
-        assert!(matches!(app.screen, Screen::Home(ref h) if h.create_input.is_none()));
+        assert!(home_of(&app).create_dialog.is_none());
 
-        if let Screen::Home(ref mut home) = app.screen {
-            home.active_panel = PANEL_IMAGES;
-        }
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
         HomeScreen::open_create_dialog(&mut app);
-        assert!(matches!(app.screen, Screen::Home(ref h) if h.create_input.is_some()));
+        assert!(home_of(&app).create_dialog.is_some());
     }
 
     #[test]
     fn the_dialog_swallows_keys_that_would_otherwise_act() {
-        let mut app = App::with_screen(Screen::Home(home()));
-        if let Screen::Home(ref mut home) = app.screen {
-            home.active_panel = PANEL_IMAGES;
-        }
+        let mut app = app_with(home());
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
         HomeScreen::open_create_dialog(&mut app);
 
         for ch in "db-1".chars() {
@@ -662,46 +1228,34 @@ mod tests {
             &mut app,
             KeyEvent::from(KeyCode::Char('q'))
         ));
-        assert!(
-            matches!(app.screen, Screen::Home(ref h) if h.create_input.as_deref() == Some("db-1q"))
-        );
+        assert_eq!(home_of(&app).dialog_name(), Some("db-1q"));
         assert!(!app.exit);
 
         // Spaces and slashes are not valid in a name.
         HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Char(' ')));
         HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Char('/')));
-        assert!(
-            matches!(app.screen, Screen::Home(ref h) if h.create_input.as_deref() == Some("db-1q"))
-        );
+        assert_eq!(home_of(&app).dialog_name(), Some("db-1q"));
 
         HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Backspace));
-        assert!(
-            matches!(app.screen, Screen::Home(ref h) if h.create_input.as_deref() == Some("db-1"))
-        );
+        assert_eq!(home_of(&app).dialog_name(), Some("db-1"));
     }
 
     #[test]
     fn a_bare_c_is_a_name_character() {
-        let mut app = App::with_screen(Screen::Home(home()));
-        if let Screen::Home(ref mut home) = app.screen {
-            home.active_panel = PANEL_IMAGES;
-        }
+        let mut app = app_with(home());
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
         HomeScreen::open_create_dialog(&mut app);
 
         for ch in "cache".chars() {
             HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Char(ch)));
         }
-        assert!(
-            matches!(app.screen, Screen::Home(ref h) if h.create_input.as_deref() == Some("cache"))
-        );
+        assert_eq!(home_of(&app).dialog_name(), Some("cache"));
     }
 
     #[test]
     fn ctrl_c_cancels_the_dialog_and_discards_the_name() {
-        let mut app = App::with_screen(Screen::Home(home()));
-        if let Screen::Home(ref mut home) = app.screen {
-            home.active_panel = PANEL_IMAGES;
-        }
+        let mut app = app_with(home());
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
         HomeScreen::open_create_dialog(&mut app);
         HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Char('d')));
 
@@ -709,7 +1263,7 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
         ));
-        assert!(matches!(app.screen, Screen::Home(ref h) if h.create_input.is_none()));
+        assert!(home_of(&app).create_dialog.is_none());
 
         // With the dialog closed the key is no longer swallowed.
         assert!(!HomeScreen::handle_dialog_key(
@@ -720,26 +1274,132 @@ mod tests {
 
     #[test]
     fn enter_on_an_empty_name_keeps_the_dialog_open() {
-        let mut app = App::with_screen(Screen::Home(home()));
-        if let Screen::Home(ref mut home) = app.screen {
-            home.active_panel = PANEL_IMAGES;
-        }
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
         HomeScreen::open_create_dialog(&mut app);
 
         HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(app.screen, Screen::Home(ref h) if h.create_input.as_deref() == Some("")));
+        assert_eq!(home_of(&app).dialog_name(), Some(""));
+        assert!(probe.actions().is_empty());
+    }
+
+    #[test]
+    fn enter_creates_from_the_full_reference_in_the_background() {
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
+        HomeScreen::open_create_dialog(&mut app);
+        for ch in "db-1".chars() {
+            HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Char(ch)));
+        }
+
+        HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(home_of(&app).create_dialog.is_none());
+        assert_eq!(
+            probe.actions(),
+            [Action::CreateContainer {
+                name: "db-1".to_string(),
+                image: "docker.io/library/postgres:latest".to_string(),
+            }]
+        );
+
+        // Once it exists, the next list puts the cursor on it.
+        let refresh_seq = app.refresh.sent + 1;
+        probe.reply(Reply::Finished {
+            action: Action::CreateContainer {
+                name: "db-1".to_string(),
+                image: "docker.io/library/postgres:latest".to_string(),
+            },
+            result: Ok(()),
+        });
+        app.drain_replies();
+        assert_eq!(
+            probe.refreshes(),
+            [Refresh {
+                seq: refresh_seq,
+                kind: RefreshKind::Home
+            }]
+        );
+
+        let mut containers = home().containers;
+        containers.push(entry("db-1", "stopped"));
+        probe.reply(Reply::Lists {
+            seq: refresh_seq,
+            containers: Ok(containers),
+            images: Ok(vec![image("postgres", "latest")]),
+        });
+        app.drain_replies();
+        assert_eq!(
+            home_of(&app).cursor_container().map(|c| c.id.as_str()),
+            Some("db-1")
+        );
+    }
+
+    #[test]
+    fn the_dialog_keeps_its_image_when_a_refresh_moves_the_cursor() {
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
+        HomeScreen::open_create_dialog(&mut app);
+        HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Char('x')));
+
+        // postgres was deleted elsewhere while the dialog was open.
+        let seq = app.request_refresh();
+        probe.reply(Reply::Lists {
+            seq,
+            containers: Ok(home().containers),
+            images: Ok(vec![image("alpine", "edge")]),
+        });
+        app.drain_replies();
+        HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(
+            probe.actions(),
+            [Action::CreateContainer {
+                name: "x".to_string(),
+                image: "docker.io/library/postgres:latest".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn s_stops_the_focused_container_in_the_background() {
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        home_mut(&mut app).selected_rows[PANEL_CONTAINERS] = 1; // bravo, running
+
+        HomeScreen::handle_start_stop_container(&mut app);
+        HomeScreen::handle_start_stop_container(&mut app);
+        assert_eq!(
+            probe.actions(),
+            [Action::StopContainer("bravo".to_string())],
+            "a second press while stopping does nothing"
+        );
+
+        // Another container can go at the same time.
+        home_mut(&mut app).selected_rows[PANEL_CONTAINERS] = 0;
+        HomeScreen::handle_start_stop_container(&mut app);
+        assert_eq!(
+            probe.actions(),
+            [Action::StartContainer("alpha".to_string())]
+        );
+
+        // Nothing is focused on the images panel.
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
+        HomeScreen::handle_start_stop_container(&mut app);
+        assert!(probe.actions().is_empty());
     }
 
     #[test]
     fn esc_closes_the_help_panel_before_leaving_the_screen() {
-        let mut app = App::with_screen(Screen::Home(home()));
+        let mut app = app_with(home());
 
         HomeScreen::toggle_help(&mut app);
-        assert!(matches!(app.screen, Screen::Home(ref h) if h.show_help));
+        assert!(home_of(&app).show_help);
 
         // First Esc only dismisses the panel; the screen stays put.
         HomeScreen::handle_esc(&mut app);
-        assert!(matches!(app.screen, Screen::Home(ref h) if !h.show_help));
+        assert!(!home_of(&app).show_help);
+
+        HomeScreen::handle_esc(&mut app);
+        assert!(matches!(app.screen, Screen::Status(ref s) if !s.auto_navigate));
     }
 
     #[test]

@@ -16,7 +16,7 @@ tab together with delete and shell. See [Suggested order](#suggested-order).
 
 Most of the features below depend on these, so they come first.
 
-- [ ] **Refresh the home screen on a timer.** `App::refresh_status`
+- [x] **Refresh the home screen on a timer.** `App::refresh_status`
   (`crates/lib/src/screens/mod.rs`) only refreshes the status screen.
   - The problem: containers started in another terminal, or ones that crash,
     only show up after you act on something.
@@ -25,7 +25,7 @@ Most of the features below depend on these, so they come first.
     the same container; images need the same treatment.
   - If the container system stops while the home screen is open, go back to
     the status screen.
-- [ ] **Run commands in the background and show their errors.** `run_command`
+- [x] **Run commands in the background and show their errors.** `run_command`
   blocks until the command finishes, then discards its exit status and
   stderr. `container stop` alone can freeze the UI for 5 s (its default
   `--time`), and a failed start looks the same as nothing happening.
@@ -35,14 +35,14 @@ Most of the features below depend on these, so they come first.
   - Show progress ("stopping postgres…") while a command runs.
   - `Notice` (`crates/lib/src/screens/selection.rs`) is currently only used
     to confirm copies. Extend it so a failed command shows its stderr.
-- [ ] **Scroll long lists.** The lists are drawn as plain text and can't
+- [x] **Scroll long lists.** The lists are drawn as plain text and can't
   scroll. At 80×24 each panel fits 8 rows, and the cursor disappears when
   it moves past them.
   - Fix: ratatui's `Table` + `TableState` scrolls to the selected row and
     keeps the header aligned.
   - `render` runs on `&App`, so either build a `TableState` each frame from
     `selected_rows` or keep the scroll offset in `HomeScreen`.
-- [ ] **Parse JSON instead of text tables.** `ls`, `image ls`, `stats`,
+- [x] **Parse JSON instead of text tables.** `ls`, `image ls`, `stats`,
   `system df` and `system status` all accept `--format json`. Field lists
   are under [Useful CLI output](#useful-cli-output).
   - One call returns a container's image, resources, start time, hostname,
@@ -94,9 +94,10 @@ screen text by dragging.
   - Run `container exec -it <id> sh` in the real terminal.
   - When it exits, restore the TUI and redraw everything.
   - Use `sh`, since many images don't include bash.
-- [ ] **More container columns.** `container ls -a` already prints IMAGE, OS,
-  ARCH, CPUS, MEMORY and STARTED, but `parse_containers` only keeps ID, STATE
-  and IP. Hide the less important columns on narrow terminals.
+- [ ] **More container columns.** The `container ls --format json` output
+  already carries the image, OS, architecture, CPUs, memory and start time,
+  but `parse_containers` only keeps ID, state and IP. Hide the less important
+  columns on narrow terminals.
 - [ ] **`/` filters the focused list by name.** Help moves to `?`. The help
   panel then lists the app's own keys as well as the CLI cheat sheet.
 - [ ] **`y` copies** the selected container's IP or ID, using the existing
@@ -110,8 +111,8 @@ This is the core of lazydocker's layout:
 - `[` and `]` switch tabs, `Enter` moves focus to the pane so it can scroll,
   and `Esc` goes back to the list.
 
-At 80 columns, image rows (76 columns, see `image_row`) won't fit in a
-third-width side panel. Two ways out:
+At 80 columns, image rows (76 columns, see the column widths in
+`home_screen/mod.rs`) won't fit in a third-width side panel. Two ways out:
 - The side lists show only name and state, and everything else moves into
   the pane.
 - Keep today's stacked layout on terminals narrower than about 120 columns.

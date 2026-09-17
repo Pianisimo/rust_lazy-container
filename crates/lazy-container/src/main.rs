@@ -2,5 +2,5 @@ use std::io;
 use lib::App;
 
 fn main() -> io::Result<()> {
-    ratatui::run(|terminal| App::default().run(terminal))
+    ratatui::run(|terminal| App::new()?.run(terminal))
 }

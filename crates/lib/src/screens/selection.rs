@@ -2,18 +2,12 @@
 //! terminal, so the app draws the highlight itself and copies the text under
 //! it the moment the button is released.
 
-use std::time::{Duration, Instant};
-
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
-    style::{Modifier, Stylize},
-    text::{Line, Span},
-    widgets::Widget,
+    style::Modifier,
+    text::Span,
 };
-
-/// How long a notice such as "Copied 12 characters" stays on screen.
-const NOTICE_DURATION: Duration = Duration::from_secs(3);
 
 /// A drag in progress, or the last one, in screen cells. Runs like terminal
 /// selection does: from the anchor to the end of its row, whole rows between,
@@ -97,65 +91,6 @@ impl Selection {
     }
 }
 
-/// A short-lived message in the top-right corner, confirming a copy or
-/// reporting that it failed.
-#[derive(Debug)]
-pub(crate) struct Notice {
-    text: String,
-    is_error: bool,
-    shown_at: Instant,
-}
-
-impl Notice {
-    pub(crate) fn copied(text: &str) -> Self {
-        Self::new(copied_message(text), false)
-    }
-
-    pub(crate) fn copy_failed() -> Self {
-        Self::new("Copy failed".to_string(), true)
-    }
-
-    fn new(text: String, is_error: bool) -> Self {
-        Self {
-            text,
-            is_error,
-            shown_at: Instant::now(),
-        }
-    }
-
-    pub(crate) fn is_visible(&self) -> bool {
-        self.shown_at.elapsed() < NOTICE_DURATION
-    }
-
-    /// Drawn over the top border, where every screen has one, clear of the
-    /// centred title.
-    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
-        let text = format!(" {} ", self.text);
-        let line = if self.is_error {
-            Line::from(text).red().bold()
-        } else {
-            Line::from(text).green().bold()
-        };
-        let width = (line.width() as u16).min(area.width.saturating_sub(4));
-        let spot = Rect {
-            x: area.right().saturating_sub(width + 2),
-            y: area.top(),
-            width,
-            height: 1.min(area.height),
-        };
-        line.render(spot, buf);
-    }
-}
-
-/// "Copied 1 character" / "Copied 12 characters". Counts characters, not
-/// bytes, so non-ASCII text reads the way it looks.
-fn copied_message(text: &str) -> String {
-    match text.chars().count() {
-        1 => "Copied 1 character".to_string(),
-        n => format!("Copied {n} characters"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,27 +145,5 @@ mod tests {
             .filter(|&(x, y)| buf[(x, y)].modifier.contains(Modifier::REVERSED))
             .collect();
         assert_eq!(reversed, [(2, 0), (3, 0), (0, 1), (1, 1)]);
-    }
-
-    #[test]
-    fn copied_message_counts_characters_not_bytes() {
-        assert_eq!(copied_message("a"), "Copied 1 character");
-        assert_eq!(copied_message("café"), "Copied 4 characters");
-    }
-
-    #[test]
-    fn a_notice_expires() {
-        let mut notice = Notice::copied("bravo");
-        assert!(notice.is_visible());
-        notice.shown_at -= NOTICE_DURATION;
-        assert!(!notice.is_visible());
-    }
-
-    #[test]
-    fn the_notice_sits_on_the_top_border_at_the_right() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
-        Notice::copied("bravo").render(buf.area, &mut buf);
-        let top: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
-        assert_eq!(top, format!("{:>38}  ", " Copied 5 characters "));
     }
 }

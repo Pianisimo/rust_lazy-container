@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Apple `container` CLI — use the `apple-container` skill
 
-lazy-container is a ratatui TUI, modeled on lazydocker, for Apple's [`container`](https://github.com/apple/container) CLI. It runs the CLI through `std::process::Command`: `run_command` in `crates/lib/src/screens/mod.rs`, plus the direct calls in `screens/status_screen.rs` and `screens/home_screen/`.
+lazy-container is a ratatui TUI, modeled on lazydocker, for Apple's [`container`](https://github.com/apple/container) CLI. It runs the CLI through `std::process::Command` in `crates/lib/src/screens/cli.rs`, only ever from the background threads in `screens/worker.rs`, and parses its `--format json` output in `screens/status_screen.rs` and `screens/home_screen/`.
 
 **Load the `apple-container` skill before any work that touches the `container` CLI** (most tasks here do): adding or changing a command, parsing its output, or planning a feature from `tentative-features.md`. `container` is not Docker. Never guess a command, flag, or output field from Docker; check the skill, or run `container <command> --help`.
 
@@ -73,6 +73,8 @@ All apps follow the same structure:
 ### External event integration (`external-events`)
 
 When mixing keyboard input with another event source, replace `event::read()` (blocks forever) with `event::poll(timeout)` (returns after at most `timeout` ms). This gives the loop a heartbeat. Events from the background source (here: `notify` file-system watcher) cross the thread boundary via a stdlib `mpsc` channel, drained with `try_recv` in a loop each iteration.
+
+`lib` uses the same pattern for the `container` CLI: `screens/worker.rs` runs commands and refreshes on two threads, and `App::run` drains their replies every tick.
 
 ### Workspace-wide lint rules
 
