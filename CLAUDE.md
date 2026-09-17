@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Apple `container` CLI — use the `apple-container` skill
+
+lazy-container is a ratatui TUI, modeled on lazydocker, for Apple's [`container`](https://github.com/apple/container) CLI. It runs the CLI through `std::process::Command`: `run_command` in `crates/lib/src/screens/mod.rs`, plus the direct calls in `screens/status_screen.rs` and `screens/home_screen/`.
+
+**Load the `apple-container` skill before any work that touches the `container` CLI** (most tasks here do): adding or changing a command, parsing its output, or planning a feature from `tentative-features.md`. `container` is not Docker. Never guess a command, flag, or output field from Docker; check the skill, or run `container <command> --help`.
+
+- It is a personal skill in `~/.claude/skills/apple-container/`, not part of this repo. If it isn't in the session's skill list, say so instead of answering CLI questions from memory.
+- Its notes for this project are in `references/inspection-and-scripting.md`, under "Our consumer: `rust/lazy-container`": parse `--format json` output instead of tables, and run blocking commands such as `container stop` off the UI thread.
+- The skill and `tentative-features.md` were both checked against `container` 1.4.1. Run `container --version` first; on any other version, trust `container <command> --help` over both.
+
 ## Commands
 
 ```bash
