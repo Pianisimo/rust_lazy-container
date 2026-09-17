@@ -58,7 +58,8 @@ Most of the features below depend on these, so they come first.
 |---|---|---|
 | Container and image lists, hide stopped | `ls -a`, `image ls` | ✅ |
 | Start / stop | `start`, `stop` | ✅ |
-| Remove (asks before forcing a running container) | `delete [--force]` | ❌ |
+| Remove (asks before forcing a running container) | `delete [--force]` | ✅ `d` |
+| Remove with volumes (`docker rm -v`) | no flag: `delete`, then `volume delete` for its anonymous volumes | ✅ `D`, "purge" |
 | Restart | no command; `stop` then `start` | ❌ |
 | Shell into a container | `exec -it <id> sh` | ❌ (only in the help panel text) |
 | Logs tab | `logs -f -n <lines>`, plus `--boot` | ❌ |
@@ -82,8 +83,15 @@ screen text by dragging.
 
 ### Tier 1: quick wins
 
-- [ ] **`d` delete** the selected container, asking y/n first. If it's
+- [x] **`d` delete** the selected container, asking y/n first. If it's
   running, offer `container delete --force`.
+  - `D` deletes its anonymous volumes as well, as `docker rm -v` does. The
+    app calls this purging, so `prune` stays free for the bulk menu's
+    "remove every stopped container".
+    `container delete` has no option for that, so the app runs
+    `volume delete` for each one once the container is gone.
+  - Like Docker, `D` keeps named volumes, and anonymous ones that another
+    container still mounts. The dialog lists what goes and what stays.
 - [ ] **`r` restart.** The CLI has no restart command, so run `stop` and then
   `start`.
 - [ ] **`K` kill** with `container kill`, optionally choosing a signal with
@@ -202,7 +210,9 @@ Existing keys keep their meaning, except help, which moves from `/` to `?`.
 | `↑↓` | lists | move | existing |
 | `?` | home screen | help | moved from `/` |
 | `/` | lists | filter by name | new |
-| `d` | lists | delete, after asking | new |
+| `d` | containers | delete, after asking | existing |
+| `D` | containers | purge: delete it with its anonymous volumes, after asking | existing |
+| `d` | images | delete, after asking | new |
 | `r` | containers | restart | new |
 | `K` | containers | kill | new |
 | `E` | containers | shell | new |
@@ -230,9 +240,13 @@ change them.
 - `configuration.resources.{cpus,memoryInBytes}`
 - `configuration.initProcess`: `executable`, `arguments`, `environment`,
   `workingDirectory`
-- `configuration.publishedPorts`, `configuration.mounts`,
-  `configuration.labels`. These were empty on the sample container, so their
-  names come from `ContainerConfiguration.swift` in apple/container.
+- `configuration.publishedPorts` and `configuration.labels`. These were
+  empty on the sample container, so their names come from
+  `ContainerConfiguration.swift` in apple/container.
+- `configuration.mounts[]`: `destination`, `source`, `options`, and `type`,
+  which is `{"volume": {"name": …, "format": …}}` for a volume,
+  `{"virtiofs": {}}` for a bind mount, or `{"tmpfs": {}}`. A volume's
+  `source` is its `volume.img` file.
 - `configuration.creationDate`
 
 **`container stats --no-stream --format json`** returns one object per
@@ -264,6 +278,24 @@ can pass 100 % for a container with several CPUs. Divide by
 and `resources.{containersRunning,containersTotal,images}`. The table output
 uses different names for some of these, such as `host.os` and
 `containers.total`.
+
+**`container volume ls --format json`** returns one object per volume:
+`id` (the name) and `configuration.{name,labels,source,sizeInBytes,creationDate}`.
+There is no type field. An anonymous volume has a UUID name and the label
+`com.apple.container.resource.anonymous`.
+
+**Deleting** (checked in the 1.4.1 source and on the CLI):
+
+- `container delete <id>` refuses a running container: `container <id> is
+  running and can not be deleted`. A container that is still stopping can't
+  be deleted, even with `--force`.
+- `--force` kills a running container with SIGKILL, then deletes it. There is
+  no graceful stop first.
+- Deleting removes the container's directory: its disk, config and logs.
+  Named and anonymous volumes stay, and so does the image.
+- `volume delete a b` deletes nothing if any of the names doesn't exist. A
+  volume that a container still mounts can't be deleted. In that case, the
+  reason is on a log line before the `Error:` line.
 
 **`container logs`** only accepts `--boot`, `-f` and `-n <lines>`. It has no
 timestamp or `--since` options.

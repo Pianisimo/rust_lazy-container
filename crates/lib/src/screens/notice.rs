@@ -41,6 +41,12 @@ impl Notice {
         Self::new("Copy failed".to_string(), true)
     }
 
+    /// A command finished and has something to say, such as
+    /// "Deleted web and 1 volume".
+    pub(crate) fn done(text: String) -> Self {
+        Self::new(text, false)
+    }
+
     /// `title` says what failed; `details` is the command's own explanation.
     pub(crate) fn command_failed(title: String, details: &str) -> Self {
         Self {
@@ -150,7 +156,7 @@ fn width_of(text: &str) -> usize {
 /// Breaks `text` into lines at most `width` columns wide: at spaces where it
 /// can, and inside a word only when the word alone is too wide. The text's
 /// own line breaks, blank lines included, are kept.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
 

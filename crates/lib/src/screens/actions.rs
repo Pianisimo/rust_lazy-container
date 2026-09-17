@@ -22,6 +22,14 @@ pub(crate) enum Action {
         name: String,
         image: String,
     },
+    /// `force` kills the container first if it is running. `volumes` are
+    /// anonymous volumes of it to delete once it is gone, as `docker rm -v`
+    /// would; `container delete` has no option for that.
+    DeleteContainer {
+        id: String,
+        force: bool,
+        volumes: Vec<String>,
+    },
 }
 
 impl Action {
@@ -36,6 +44,13 @@ impl Action {
             Action::CreateContainer { name, image } => {
                 &["create", &format!("--name={name}"), "--", image]
             }
+            Action::DeleteContainer { id, force, .. } => {
+                if *force {
+                    &["delete", "--force", "--", id]
+                } else {
+                    &["delete", "--", id]
+                }
+            }
         };
         args.iter().map(|arg| arg.to_string()).collect()
     }
@@ -48,6 +63,10 @@ impl Action {
             Action::StartContainer(id) => format!("Starting {id}"),
             Action::StopContainer(id) => format!("Stopping {id}"),
             Action::CreateContainer { name, .. } => format!("Creating {name}"),
+            Action::DeleteContainer { id, volumes, .. } if volumes.is_empty() => {
+                format!("Deleting {id}")
+            }
+            Action::DeleteContainer { id, .. } => format!("Purging {id}"),
         }
     }
 
@@ -59,6 +78,10 @@ impl Action {
             Action::StartContainer(id) => format!("Couldn't start {id}"),
             Action::StopContainer(id) => format!("Couldn't stop {id}"),
             Action::CreateContainer { name, .. } => format!("Couldn't create {name}"),
+            Action::DeleteContainer { id, volumes, .. } if volumes.is_empty() => {
+                format!("Couldn't delete {id}")
+            }
+            Action::DeleteContainer { id, .. } => format!("Couldn't purge {id}"),
         }
     }
 
@@ -67,6 +90,10 @@ impl Action {
         match self {
             Action::StartContainer(id) => Some((id, "starting…")),
             Action::StopContainer(id) => Some((id, "stopping…")),
+            Action::DeleteContainer { id, volumes, .. } if volumes.is_empty() => {
+                Some((id, "deleting…"))
+            }
+            Action::DeleteContainer { id, .. } => Some((id, "purging…")),
             _ => None,
         }
     }
@@ -74,7 +101,9 @@ impl Action {
     /// The container the command acts on, if it acts on one.
     fn container(&self) -> Option<&str> {
         match self {
-            Action::StartContainer(id) | Action::StopContainer(id) => Some(id),
+            Action::StartContainer(id)
+            | Action::StopContainer(id)
+            | Action::DeleteContainer { id, .. } => Some(id),
             Action::CreateContainer { name, .. } => Some(name),
             Action::StartSystem | Action::StopSystem => None,
         }
@@ -250,6 +279,41 @@ mod tests {
                 "docker.io/library/postgres:latest"
             ]
         );
+    }
+
+    fn delete(id: &str, force: bool, volumes: &[&str]) -> Action {
+        Action::DeleteContainer {
+            id: id.to_string(),
+            force,
+            volumes: volumes.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn delete_forces_only_a_running_container() {
+        assert_eq!(delete("web", false, &[]).args(), ["delete", "--", "web"]);
+        assert_eq!(
+            delete("-web", true, &["9af1cc76"]).args(),
+            ["delete", "--force", "--", "-web"]
+        );
+    }
+
+    #[test]
+    fn a_delete_says_whether_volumes_go_too() {
+        assert_eq!(delete("web", true, &[]).progress(), "Deleting web");
+        assert_eq!(delete("web", false, &[]).failure(), "Couldn't delete web");
+        let with_volumes = delete("web", false, &["9af1cc76"]);
+        assert_eq!(with_volumes.progress(), "Purging web");
+        assert_eq!(with_volumes.failure(), "Couldn't purge web");
+
+        let mut pending = PendingActions::default();
+        pending.push(delete("db", false, &[]));
+        assert_eq!(pending.row_state("db"), Some("deleting…"));
+        pending.push(with_volumes);
+        assert_eq!(pending.row_state("web"), Some("purging…"));
+        assert!(pending.blocks(&start("web")));
+        assert!(pending.blocks(&delete("web", true, &[])));
+        assert!(!pending.blocks(&delete("redis", false, &[])));
     }
 
     #[test]

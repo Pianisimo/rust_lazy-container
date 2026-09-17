@@ -263,10 +263,11 @@ impl App {
                 seq,
                 containers,
                 images,
+                volumes,
             } => {
                 self.answered(seq);
                 if let Screen::Home(home) = &mut self.screen {
-                    let error = home.update(containers, images);
+                    let error = home.update(containers, images, volumes);
                     self.report_list_error(error);
                 }
             }
@@ -293,15 +294,21 @@ impl App {
         }
     }
 
-    fn finish(&mut self, action: Action, result: Result<(), String>) {
+    fn finish(&mut self, action: Action, result: Result<Option<String>, String>) {
         match result {
-            Ok(()) => {
+            Ok(note) => {
                 // The next refresh sent is the first to show the result.
                 self.pending.succeeded(&action, self.refresh.sent + 1);
                 if let (Action::CreateContainer { name, .. }, Screen::Home(home)) =
                     (&action, &mut self.screen)
                 {
                     home.select_when_listed(name.clone());
+                }
+                // An error still waiting to be read keeps its place.
+                if let Some(note) = note
+                    && !self.notice.as_ref().is_some_and(Notice::is_sticky)
+                {
+                    self.notice = Some(Notice::done(note));
                 }
             }
             Err(message) => {
@@ -423,6 +430,11 @@ impl App {
             return;
         }
 
+        // Delete keys ignore Ctrl and Alt, so Ctrl+D can't delete anything.
+        let plain = !key_event
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+
         match key_event.code {
             KeyCode::Char('q') => self.exit = true,
             KeyCode::Enter => StatusScreen::handle_enter(self),
@@ -434,6 +446,8 @@ impl App {
             KeyCode::Char('.') => HomeScreen::cycle_container_filter(self),
             KeyCode::Char('/') => HomeScreen::toggle_help(self),
             KeyCode::Char('c') => HomeScreen::open_create_dialog(self),
+            KeyCode::Char('d') if plain => HomeScreen::open_delete_dialog(self, false),
+            KeyCode::Char('D') if plain => HomeScreen::open_delete_dialog(self, true),
             KeyCode::Up if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
                 HomeScreen::handle_shift_up(self)
             }
@@ -522,7 +536,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::home_screen::ContainerEntry;
+    use super::home_screen::{ContainerEntry, VolumeEntry};
     use super::status_screen::SystemStatus;
     use super::*;
 
@@ -544,13 +558,13 @@ mod tests {
         ContainerEntry {
             id: id.to_string(),
             state: state.to_string(),
-            addr: String::new(),
+            ..ContainerEntry::default()
         }
     }
 
     fn home_with(containers: Vec<ContainerEntry>) -> Screen {
         let mut home = HomeScreen::new();
-        home.update(Ok(containers), Ok(vec![]));
+        home.update(Ok(containers), Ok(vec![]), Ok(vec![]));
         Screen::Home(home)
     }
 
@@ -569,6 +583,7 @@ mod tests {
             seq,
             containers: Ok(containers),
             images: Ok(vec![]),
+            volumes: Ok(vec![]),
         }
     }
 
@@ -747,7 +762,7 @@ mod tests {
         press(&mut app, KeyCode::Char('s'));
         probe.reply(Reply::Finished {
             action: Action::StopContainer("web".to_string()),
-            result: Ok(()),
+            result: Ok(None),
         });
         app.drain_replies();
         assert_eq!(app.pending.row_state("web"), Some("stopping…"));
@@ -782,6 +797,7 @@ mod tests {
             seq,
             containers: Err("unexpected output".to_string()),
             images: Ok(vec![]),
+            volumes: Ok(vec![]),
         };
 
         let seq = app.request_refresh();
@@ -822,7 +838,7 @@ mod tests {
         let next = app.refresh.sent + 1;
         probe.reply(Reply::Finished {
             action: Action::StartSystem,
-            result: Ok(()),
+            result: Ok(None),
         });
         app.drain_replies();
         assert_eq!(probe.refreshes().pop().map(|r| r.seq), Some(next));
@@ -895,6 +911,160 @@ mod tests {
         assert!(!app.settle_pending);
         // The answer is still expected, and applied whenever it lands.
         assert!(app.refresh.in_flight());
+    }
+
+    /// A home screen with `web`, stopped, which mounts one anonymous volume.
+    fn web_with_a_volume() -> Screen {
+        let web = ContainerEntry {
+            volumes: vec!["9af1cc76".to_string()],
+            ..container("web", "stopped")
+        };
+        let volume = VolumeEntry {
+            name: "9af1cc76".to_string(),
+            anonymous: true,
+        };
+        let mut home = HomeScreen::new();
+        home.update(Ok(vec![web]), Ok(vec![]), Ok(vec![volume]));
+        Screen::Home(home)
+    }
+
+    fn shift_d(app: &mut App) {
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn d_deletes_after_asking_and_the_row_follows() {
+        let (mut app, probe) = App::with_probe(home_with(vec![container("web", "stopped")]));
+        assert!(screen_text(&app).contains("d/D: delete/purge"));
+
+        press(&mut app, KeyCode::Char('d'));
+        assert!(screen_text(&app).contains("Delete web?"));
+        assert!(probe.actions().is_empty());
+
+        // Esc only closes the dialog.
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Home(_)));
+        assert!(!screen_text(&app).contains("Delete web?"));
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        let delete = Action::DeleteContainer {
+            id: "web".to_string(),
+            force: false,
+            volumes: vec![],
+        };
+        assert_eq!(probe.actions(), std::slice::from_ref(&delete));
+        let text = screen_text(&app);
+        assert!(text.contains("web             deleting…"), "{text}");
+        assert!(text.contains("Deleting web…"), "{text}");
+
+        // The row stays until a refresh no longer lists it.
+        probe.reply(Reply::Finished {
+            action: delete,
+            result: Ok(None),
+        });
+        app.drain_replies();
+        assert!(app.notice.is_none());
+        assert!(screen_text(&app).contains("deleting…"));
+
+        let seq = probe.refreshes().pop().unwrap().seq;
+        probe.reply(lists(seq, vec![]));
+        app.drain_replies();
+        assert!(app.pending.is_empty());
+        let text = screen_text(&app);
+        assert!(!text.contains("web"), "{text}");
+        // Nothing is focused, so the delete hints go too.
+        assert!(!text.contains("d/D"), "{text}");
+    }
+
+    #[test]
+    fn shift_d_deletes_the_volume_too_and_says_so() {
+        let (mut app, probe) = App::with_probe(web_with_a_volume());
+        shift_d(&mut app);
+        let text = screen_text(&app);
+        assert!(text.contains("Purge container"), "{text}");
+        assert!(
+            text.contains("Its anonymous volume is deleted too:"),
+            "{text}"
+        );
+        assert!(text.contains("9af1cc76"), "{text}");
+
+        press(&mut app, KeyCode::Char('y'));
+        let delete = Action::DeleteContainer {
+            id: "web".to_string(),
+            force: false,
+            volumes: vec!["9af1cc76".to_string()],
+        };
+        assert_eq!(probe.actions(), std::slice::from_ref(&delete));
+        assert!(screen_text(&app).contains("Purging web…"));
+
+        probe.reply(Reply::Finished {
+            action: delete,
+            result: Ok(Some("Purged web and 1 volume".to_string())),
+        });
+        app.drain_replies();
+        assert!(app.notice.as_ref().is_some_and(|n| !n.is_sticky()));
+        let top_row = screen_text(&app).lines().next().unwrap().to_string();
+        assert!(top_row.contains(" Purged web and 1 volume "), "{top_row}");
+    }
+
+    #[test]
+    fn a_note_leaves_an_unread_error_in_place() {
+        let (mut app, probe) = App::with_probe(web_with_a_volume());
+        app.notice = Some(Notice::command_failed(
+            "Couldn't start db".to_string(),
+            "boom",
+        ));
+        probe.reply(Reply::Finished {
+            action: Action::DeleteContainer {
+                id: "web".to_string(),
+                force: false,
+                volumes: vec!["9af1cc76".to_string()],
+            },
+            result: Ok(Some("Purged web and 1 volume".to_string())),
+        });
+        app.drain_replies();
+        assert!(screen_text(&app).contains("Couldn't start db"));
+    }
+
+    #[test]
+    fn volumes_that_stay_behind_are_reported() {
+        let (mut app, probe) = App::with_probe(web_with_a_volume());
+        shift_d(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let delete = probe.actions().pop().unwrap();
+
+        probe.reply(Reply::Finished {
+            action: delete,
+            result: Err("web was deleted, but its volumes weren't:\nno space left".to_string()),
+        });
+        app.drain_replies();
+        let text = screen_text(&app);
+        assert!(text.contains("Couldn't purge web"), "{text}");
+        assert!(text.contains("no space left"), "{text}");
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn ctrl_d_and_alt_d_delete_nothing() {
+        let mut app = App::with_screen(web_with_a_volume());
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), modifiers));
+            app.handle_key_event(KeyEvent::new(
+                KeyCode::Char('D'),
+                modifiers | KeyModifiers::SHIFT,
+            ));
+        }
+        assert!(!screen_text(&app).contains("Delete"));
+    }
+
+    #[test]
+    fn d_does_nothing_on_the_status_screen() {
+        let (mut app, probe) = App::with_probe(status_screen(running(), false));
+        press(&mut app, KeyCode::Char('d'));
+        shift_d(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert!(probe.actions().is_empty());
     }
 
     #[test]

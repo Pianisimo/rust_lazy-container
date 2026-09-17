@@ -70,7 +70,15 @@ pub(crate) fn output_of(args: &[&str]) -> Result<String, String> {
 }
 
 /// Runs a command the user asked for, such as `stop`, and says whether it
-/// worked.
+/// worked. [`run_detached`] explains how it is run.
+pub(crate) fn run_action(args: &[&str]) -> Result<(), String> {
+    run_detached(args)
+        .map_err(|e| format!("couldn't run container: {e}"))?
+        .into_result()
+        .map(drop)
+}
+
+/// Like [`run_action`], for callers that read the output themselves.
 ///
 /// Unlike [`run`], the command is set up to finish even if the app quits
 /// first, since `system stop` stopped halfway leaves the system in pieces:
@@ -79,25 +87,19 @@ pub(crate) fn output_of(args: &[&str]) -> Result<String, String> {
 ///   as it goes;
 /// - it runs in its own process group, so the hangup sent when the terminal
 ///   closes doesn't reach it.
-pub(crate) fn run_action(args: &[&str]) -> Result<(), String> {
-    let finished = (|| {
-        let mut stdout = unlinked_file()?;
-        let mut stderr = unlinked_file()?;
-        let status = container(args)
-            .process_group(0)
-            .stdout(stdout.try_clone()?)
-            .stderr(stderr.try_clone()?)
-            .status()?;
-        Ok::<_, io::Error>(Output::new(
-            status,
-            &read_from_start(&mut stdout)?,
-            &read_from_start(&mut stderr)?,
-        ))
-    })();
-    finished
-        .map_err(|e| format!("couldn't run container: {e}"))?
-        .into_result()
-        .map(drop)
+pub(crate) fn run_detached(args: &[&str]) -> io::Result<Output> {
+    let mut stdout = unlinked_file()?;
+    let mut stderr = unlinked_file()?;
+    let status = container(args)
+        .process_group(0)
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .status()?;
+    Ok(Output::new(
+        status,
+        &read_from_start(&mut stdout)?,
+        &read_from_start(&mut stderr)?,
+    ))
 }
 
 fn container(args: &[&str]) -> Command {

@@ -21,8 +21,8 @@ use std::time::Duration;
 use super::actions::Action;
 use super::cli;
 use super::home_screen::{
-    ContainerEntry, DEFAULT_REGISTRY_DOMAIN, ImageEntry, fetch_containers, fetch_images,
-    fetch_registry_domain,
+    ContainerEntry, DEFAULT_REGISTRY_DOMAIN, ImageEntry, VolumeEntry, delete_left_behind,
+    fetch_containers, fetch_images, fetch_registry_domain, fetch_volumes,
 };
 use super::status_screen::{SystemStatus, fetch_system_status};
 
@@ -45,19 +45,21 @@ pub(crate) struct Refresh {
 pub(crate) enum Reply {
     /// `container system status`, for the status screen.
     Status { seq: u64, status: SystemStatus },
-    /// Both lists, for the home screen. A list that couldn't be read carries
-    /// the reason instead.
+    /// The home screen's lists, volumes included. A list that couldn't be
+    /// read carries the reason instead.
     Lists {
         seq: u64,
         containers: Result<Vec<ContainerEntry>, String>,
         images: Result<Vec<ImageEntry>, String>,
+        volumes: Result<Vec<VolumeEntry>, String>,
     },
     /// The home screen asked for its lists, but the system isn't running.
     SystemDown { seq: u64, status: SystemStatus },
-    /// A command the user asked for has exited.
+    /// A command the user asked for has exited. A success may come with a
+    /// note for the user, such as how many volumes went with a container.
     Finished {
         action: Action,
-        result: Result<(), String>,
+        result: Result<Option<String>, String>,
     },
 }
 
@@ -114,12 +116,26 @@ impl Worker {
 
 fn run_actions(requests: Receiver<Action>, replies: Sender<Reply>) {
     for action in requests {
-        let args = action.args();
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = cli::run_action(&args);
+        let result = run(&action);
         if replies.send(Reply::Finished { action, result }).is_err() {
             break;
         }
+    }
+}
+
+/// Runs `action`'s command, then whatever has to follow it.
+fn run(action: &Action) -> Result<Option<String>, String> {
+    let args = action.args();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    cli::run_action(&args)?;
+
+    match action {
+        Action::DeleteContainer { id, volumes, .. } if !volumes.is_empty() => {
+            let cleanup = delete_left_behind(volumes)
+                .map_err(|e| format!("{id} was deleted, but its volumes weren't:\n{e}"))?;
+            Ok(Some(cleanup.note(id)))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -174,6 +190,7 @@ fn refresh_home(seq: u64, registry_domain: &mut Option<String>) -> Reply {
         seq,
         containers,
         images,
+        volumes: fetch_volumes(),
     }
 }
 
@@ -242,7 +259,7 @@ mod tests {
 
         probe.reply(Reply::Finished {
             action: Action::StartSystem,
-            result: Ok(()),
+            result: Ok(None),
         });
         probe.reply(Reply::Finished {
             action: Action::StopSystem,
@@ -253,7 +270,7 @@ mod tests {
             worker.try_recv(),
             Some(Reply::Finished {
                 action: Action::StartSystem,
-                result: Ok(())
+                result: Ok(None)
             })
         ));
         assert!(matches!(
@@ -286,9 +303,19 @@ mod tests {
                 seq: 1,
                 containers,
                 images,
+                volumes,
             }) => {
                 let containers = containers.expect("containers");
                 let images = images.expect("images");
+                let volumes = volumes.expect("volumes");
+                assert!(volumes.iter().all(|v| !v.name.is_empty()));
+                // Every volume a container mounts is listed.
+                assert!(
+                    containers
+                        .iter()
+                        .flat_map(|c| &c.volumes)
+                        .all(|name| volumes.iter().any(|v| v.name == *name))
+                );
                 assert!(
                     containers
                         .iter()

@@ -1,14 +1,18 @@
 pub(crate) mod container_list_panel;
+mod delete_dialog;
 pub(crate) mod help_panel;
 pub(crate) mod images_list_panel;
+pub(crate) mod volumes;
 
 use std::time::Instant;
 
 use container_list_panel::ContainerFilter;
 pub(crate) use container_list_panel::{ContainerEntry, fetch_containers};
+use delete_dialog::DeleteDialog;
 pub(crate) use images_list_panel::{
     DEFAULT_REGISTRY_DOMAIN, ImageEntry, fetch_images, fetch_registry_domain,
 };
+pub(crate) use volumes::{VolumeEntry, delete_left_behind, fetch_volumes};
 
 use crate::screens::actions::{Action, PendingActions};
 use crate::screens::{App, Screen, StatusScreen};
@@ -44,9 +48,9 @@ const COLUMN_SPACING: u16 = 1;
 /// Rows the column titles take at the top of a list.
 const HEADER_HEIGHT: u16 = 1;
 
-// Column widths. The name columns grow to fit their longest entry; the last
-// column of each list takes whatever is left.
-const CONTAINER_NAME_WIDTH: u16 = 15;
+// Column widths. The ID and name columns grow to fit their longest entry;
+// the last column of each list takes whatever is left.
+const CONTAINER_ID_WIDTH: u16 = 15;
 /// "running" and "stopping…", plus one more column before the IP.
 const CONTAINER_STATE_WIDTH: u16 = 11;
 /// The longest name among the usual images: `ghcr.io/apple/containerization/vminit`.
@@ -147,6 +151,29 @@ struct ListPanel<'a> {
     widths: Vec<u16>,
 }
 
+/// A key the footer names, and what it does.
+struct Hint {
+    key: &'static str,
+    action: &'static str,
+    /// When the footer doesn't fit, the lowest go first.
+    priority: u8,
+}
+
+impl Hint {
+    fn new(key: &'static str, action: &'static str, priority: u8) -> Self {
+        Self {
+            key,
+            action,
+            priority,
+        }
+    }
+
+    /// Columns of `key: action `.
+    fn width(&self) -> usize {
+        Span::raw(self.key).width() + ": ".len() + Span::raw(self.action).width() + 1
+    }
+}
+
 /// Where each part of the home screen goes.
 struct Areas {
     containers: Rect,
@@ -175,10 +202,15 @@ pub(crate) struct HomeScreen {
     containers: Vec<ContainerEntry>,
     container_filter: ContainerFilter,
     images: Vec<ImageEntry>,
+    /// Every volume. No panel shows them; the delete dialog uses them.
+    volumes: Vec<VolumeEntry>,
     show_help: bool,
     /// `Some` while the create-container dialog is open, which makes it
     /// modal: it swallows every key.
     create_dialog: Option<CreateDialog>,
+    /// `Some` while the delete dialog is open. It is modal too. The two
+    /// never open together: each needs a different panel to have focus.
+    delete_dialog: Option<DeleteDialog>,
     /// A container created from the dialog. The cursor moves to it once a
     /// refresh lists it.
     awaited_container: Option<String>,
@@ -190,13 +222,14 @@ impl HomeScreen {
         Self::default()
     }
 
-    /// Takes fresh copies of both lists and keeps each cursor on the item it
+    /// Takes fresh copies of the lists and keeps each cursor on the item it
     /// was on. A list that couldn't be read keeps its old rows, and the
     /// reason is handed back for the app to show.
     pub(crate) fn update(
         &mut self,
         containers: Result<Vec<ContainerEntry>, String>,
         images: Result<Vec<ImageEntry>, String>,
+        volumes: Result<Vec<VolumeEntry>, String>,
     ) -> Option<String> {
         let mut errors = Vec::new();
         match containers {
@@ -205,6 +238,10 @@ impl HomeScreen {
         }
         match images {
             Ok(images) => self.set_images(images),
+            Err(e) => errors.push(e),
+        }
+        match volumes {
+            Ok(volumes) => self.volumes = volumes,
             Err(e) => errors.push(e),
         }
         errors.dedup();
@@ -224,6 +261,12 @@ impl HomeScreen {
             // If the container is gone, the cursor stays on the same row
             // instead of jumping to the top.
             None => self.select_container_or(current.as_deref(), row),
+        }
+
+        // Deleted elsewhere while the dialog asked about it.
+        let gone = |id: &str| !self.containers.iter().any(|c| c.id == id);
+        if self.delete_dialog.as_ref().is_some_and(|d| gone(&d.id)) {
+            self.delete_dialog = None;
         }
     }
 
@@ -265,12 +308,16 @@ impl HomeScreen {
         }
     }
 
-    /// While the dialog is open it owns every key, so `q` does not quit and the
+    /// While a dialog is open it owns every key, so `q` does not quit and the
     /// arrows do not move the lists underneath. Returns whether it consumed one.
     pub(crate) fn handle_dialog_key(app: &mut App, key: KeyEvent) -> bool {
         let Screen::Home(home) = &mut app.screen else {
             return false;
         };
+        if home.delete_dialog.is_some() {
+            Self::handle_delete_dialog_key(app, key);
+            return true;
+        }
         let Some(dialog) = home.create_dialog.as_mut() else {
             return false;
         };
@@ -306,6 +353,44 @@ impl HomeScreen {
         }
 
         true
+    }
+
+    /// `d` — ask before deleting the focused container. `D` asks before
+    /// deleting its anonymous volumes as well.
+    pub(crate) fn open_delete_dialog(app: &mut App, with_volumes: bool) {
+        let Screen::Home(home) = &mut app.screen else {
+            return;
+        };
+        let Some(container) = home.focused_container() else {
+            return;
+        };
+        let dialog = DeleteDialog::new(container, with_volumes, &home.containers, &home.volumes);
+        // As with `s`, a container something is still being done to has to
+        // wait for that to finish.
+        if app.pending.blocks(&dialog.action()) {
+            return;
+        }
+        home.delete_dialog = Some(dialog);
+    }
+
+    /// Enter or `y` deletes; Esc, `n` or Ctrl+C cancels. The command runs in
+    /// the background, like `s`.
+    fn handle_delete_dialog_key(app: &mut App, key: KeyEvent) {
+        let Screen::Home(home) = &mut app.screen else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') if !ctrl => {
+                if let Some(dialog) = home.delete_dialog.take() {
+                    app.submit(dialog.action());
+                }
+            }
+            KeyCode::Char('c') if ctrl => home.delete_dialog = None,
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => home.delete_dialog = None,
+            _ => {}
+        }
     }
 
     /// `/` — show or hide the help panel.
@@ -475,47 +560,58 @@ impl HomeScreen {
         }
     }
 
-    /// The footer hints. Built in one place so a test can check that the widest
-    /// combination still fits an 80-column terminal.
-    fn footer_hints(&self) -> Vec<Span<'static>> {
-        let help_hint = if self.show_help {
-            ": close "
-        } else {
-            ": help "
-        };
-
-        // Single spaces between hints: the bold key names carry the separation,
-        // and the line is at the width an 80-column terminal allows.
+    /// The footer hints that fit in `width` columns. Built in one place so a
+    /// test can check what an 80-column terminal shows.
+    ///
+    /// Every hint fits from 96 columns. Below that, hints are dropped by
+    /// priority: first the keys anyone would try anyway (arrows, Esc), last
+    /// the ones that act on the focused item, and quit.
+    fn footer_hints(&self, width: usize) -> Vec<Span<'static>> {
         let mut hints = vec![
-            " Shift+↑↓".blue().bold(),
-            ": panel ".dark_gray(),
-            "↑↓".blue().bold(),
-            ": move ".dark_gray(),
-            ".".blue().bold(),
-            ": filter ".dark_gray(),
-            "/".blue().bold(),
-            help_hint.dark_gray(),
+            Hint::new("Shift+↑↓", "panel", 3),
+            Hint::new("↑↓", "move", 0),
+            Hint::new(".", "filter", 2),
+            Hint::new("/", if self.show_help { "close" } else { "help" }, 4),
         ];
 
-        // Contextual: start a stopped container, stop a running one. Only one of
-        // these two can apply, since they follow which panel has focus.
+        // Contextual: they follow which panel has focus, so the container keys
+        // and `c` never show together.
         if let Some(action) = self.container_action_label() {
-            hints.push("s".blue().bold());
-            hints.push(format!(": {action} ").dark_gray());
+            hints.push(Hint::new("s", action, 6));
+        }
+        if self.focused_container().is_some() {
+            hints.push(Hint::new("d/D", "delete/purge", 6));
         }
         if self.focused_image().is_some() {
-            hints.push("c".blue().bold());
-            hints.push(": create ".dark_gray());
+            hints.push(Hint::new("c", "create", 6));
         }
 
-        hints.extend([
-            "Esc".blue().bold(),
-            ": back ".dark_gray(),
-            "q".blue().bold(),
-            ": quit ".dark_gray(),
-        ]);
+        hints.push(Hint::new("Esc", "back", 1));
+        hints.push(Hint::new("q", "quit", 7));
 
-        hints
+        // A space before the first key; each hint ends with one.
+        let total = |hints: &[Hint]| 1 + hints.iter().map(Hint::width).sum::<usize>();
+        while total(&hints) > width {
+            // The rightmost of the least important.
+            let lowest = hints
+                .iter()
+                .enumerate()
+                .rev()
+                .min_by_key(|(_, hint)| hint.priority)
+                .map(|(index, _)| index);
+            match lowest {
+                Some(index) => hints.remove(index),
+                None => break,
+            };
+        }
+
+        // Single spaces between hints: the bold key names carry the separation.
+        let mut spans = vec![Span::raw(" ")];
+        for hint in hints {
+            spans.push(hint.key.blue().bold());
+            spans.push(format!(": {} ", hint.action).dark_gray());
+        }
+        spans
     }
 
     /// Splits the screen. `render` and `keep_selection_visible` both use
@@ -545,7 +641,8 @@ impl HomeScreen {
     }
 
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, pending: &PendingActions) {
-        let instructions = Line::from(self.footer_hints());
+        // The footer sits on the bottom border, between its corners.
+        let instructions = Line::from(self.footer_hints(area.width.saturating_sub(2) as usize));
 
         Block::bordered()
             .title(Line::from(" lazy-container ").bold().centered())
@@ -560,9 +657,12 @@ impl HomeScreen {
         self.render_containers(areas.containers, buf, pending);
         self.render_images(areas.images, buf);
 
-        // Drawn last so it sits over everything else.
+        // Drawn last so they sit over everything else.
         if let Some(dialog) = &self.create_dialog {
             render_create_dialog(dialog, area, buf);
+        }
+        if let Some(dialog) = &self.delete_dialog {
+            dialog.render(area, buf);
         }
     }
 
@@ -586,10 +686,7 @@ impl HomeScreen {
 
         let containers = self.visible_containers();
         let widths = vec![
-            column_width(
-                CONTAINER_NAME_WIDTH,
-                containers.iter().map(|c| c.id.as_str()),
-            ),
+            column_width(CONTAINER_ID_WIDTH, containers.iter().map(|c| c.id.as_str())),
             CONTAINER_STATE_WIDTH,
             0,
         ];
@@ -606,7 +703,8 @@ impl HomeScreen {
         let list = ListPanel {
             index: PANEL_CONTAINERS,
             block,
-            header: Row::new(["NAME", "STATE", "IP"]),
+            // `ID`, as `container ls` calls it.
+            header: Row::new(["ID", "STATE", "IP"]),
             rows,
             widths,
         };
@@ -736,7 +834,7 @@ mod tests {
         ContainerEntry {
             id: id.to_string(),
             state: state.to_string(),
-            addr: String::new(),
+            ..ContainerEntry::default()
         }
     }
 
@@ -747,6 +845,13 @@ mod tests {
             tag: tag.to_string(),
             digest: "78481659c47e".to_string(),
             platforms: vec!["linux/arm64".to_string()],
+        }
+    }
+
+    fn volume(name: &str, anonymous: bool) -> VolumeEntry {
+        VolumeEntry {
+            name: name.to_string(),
+            anonymous,
         }
     }
 
@@ -823,7 +928,7 @@ mod tests {
         // Rows 2 and 4 of the screen: the header and bravo, inside the borders.
         assert_eq!(
             rows[2][6..].trim_end_matches([' ', '│', '┃']),
-            "   NAME            STATE       IP"
+            "   ID              STATE       IP"
         );
         assert_eq!(
             rows[4][6..].trim_end_matches([' ', '│', '┃']),
@@ -855,12 +960,12 @@ mod tests {
     }
 
     #[test]
-    fn a_long_name_widens_its_column_for_every_row() {
+    fn a_long_id_widens_its_column_for_every_row() {
         let mut screen = home();
         screen.containers[0].id = "a-very-long-container-name".to_string();
         let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
 
-        let header = row_containing(&rows, "NAME").unwrap();
+        let header = row_containing(&rows, "STATE").unwrap();
         let bravo = row_containing(&rows, "bravo").unwrap();
         let long = row_containing(&rows, "a-very-long-container-name").unwrap();
         let state_column = header.find("STATE").unwrap();
@@ -927,7 +1032,7 @@ mod tests {
         assert!(rows[10].contains(" > container-15"), "{}", rows[10]);
         assert!(row_containing(&rows, "container-07").is_none());
         // The column titles stay put above the scrolled rows.
-        assert!(rows[2].contains("NAME"));
+        assert!(rows[2].contains("ID"), "{}", rows[2]);
         assert!(rows[3].contains("container-08"), "{}", rows[3]);
 
         // Back up to the top row of the view: nothing moves.
@@ -1018,6 +1123,7 @@ mod tests {
                 entry("bravo", "stopped"),
             ]),
             Ok(vec![image("postgres", "latest")]),
+            Ok(vec![]),
         );
         assert_eq!(error, None);
         assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 2);
@@ -1034,6 +1140,7 @@ mod tests {
         screen.update(
             Ok(vec![entry("alpha", "stopped"), entry("charlie", "stopped")]),
             Ok(vec![]),
+            Ok(vec![]),
         );
         assert_eq!(
             screen.cursor_container().map(|c| c.id.as_str()),
@@ -1041,9 +1148,9 @@ mod tests {
         );
 
         // With fewer rows than the cursor's, it stops at the last one.
-        screen.update(Ok(vec![entry("alpha", "stopped")]), Ok(vec![]));
+        screen.update(Ok(vec![entry("alpha", "stopped")]), Ok(vec![]), Ok(vec![]));
         assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 0);
-        screen.update(Ok(vec![]), Ok(vec![]));
+        screen.update(Ok(vec![]), Ok(vec![]), Ok(vec![]));
         assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 0);
         assert!(screen.cursor_container().is_none());
     }
@@ -1061,6 +1168,7 @@ mod tests {
                 image("nginx", "1"),
                 image("postgres", "latest"),
             ]),
+            Ok(vec![]),
         );
         assert_eq!(screen.selected_rows[PANEL_IMAGES], 2);
 
@@ -1068,6 +1176,7 @@ mod tests {
         screen.update(
             Ok(screen.containers.clone()),
             Ok(vec![image("alpine", "edge")]),
+            Ok(vec![]),
         );
         assert_eq!(screen.selected_rows[PANEL_IMAGES], 0);
     }
@@ -1075,14 +1184,27 @@ mod tests {
     #[test]
     fn a_list_that_fails_to_load_keeps_its_rows() {
         let mut screen = home();
-        let error = screen.update(Err("no answer".to_string()), Ok(vec![]));
+        let error = screen.update(Err("no answer".to_string()), Ok(vec![]), Ok(vec![]));
         assert_eq!(error.as_deref(), Some("no answer"));
         assert_eq!(screen.containers.len(), 3);
         assert!(screen.images.is_empty());
 
-        // The same failure twice is reported once.
-        let error = screen.update(Err("down".to_string()), Err("down".to_string()));
+        // The same failure from every list is reported once.
+        fn down<T>() -> Result<T, String> {
+            Err("down".to_string())
+        }
+        let error = screen.update(down(), down(), down());
         assert_eq!(error.as_deref(), Some("down"));
+
+        // So is a volume list that fails on its own, and the volumes stay.
+        screen.volumes = vec![volume("pgdata", false)];
+        let error = screen.update(
+            Ok(home().containers),
+            Ok(vec![]),
+            Err("volume ls failed".to_string()),
+        );
+        assert_eq!(error.as_deref(), Some("volume ls failed"));
+        assert_eq!(screen.volumes, [volume("pgdata", false)]);
     }
 
     #[test]
@@ -1091,17 +1213,17 @@ mod tests {
         screen.select_when_listed("delta".to_string());
 
         // Not there yet: nothing moves.
-        screen.update(Ok(home().containers), Ok(vec![]));
+        screen.update(Ok(home().containers), Ok(vec![]), Ok(vec![]));
         assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 0);
 
         let mut containers = home().containers;
         containers.push(entry("delta", "stopped"));
-        screen.update(Ok(containers.clone()), Ok(vec![]));
+        screen.update(Ok(containers.clone()), Ok(vec![]), Ok(vec![]));
         assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 3);
 
         // Only once: later refreshes follow the cursor again.
         screen.selected_rows[PANEL_CONTAINERS] = 1;
-        screen.update(Ok(containers), Ok(vec![]));
+        screen.update(Ok(containers), Ok(vec![]), Ok(vec![]));
         assert_eq!(screen.selected_rows[PANEL_CONTAINERS], 1);
     }
 
@@ -1110,7 +1232,7 @@ mod tests {
         let mut screen = HomeScreen::new();
         let rows = draw(&mut screen, &PendingActions::default(), 80, 24);
         assert!(
-            rows[2].contains("NAME            STATE       IP"),
+            rows[2].contains("ID              STATE       IP"),
             "{}",
             rows[2]
         );
@@ -1162,6 +1284,10 @@ mod tests {
         );
     }
 
+    fn footer(screen: &HomeScreen, width: usize) -> String {
+        Line::from(screen.footer_hints(width)).to_string()
+    }
+
     #[test]
     fn footer_fits_an_eighty_column_terminal() {
         // 80 columns, less the outer border.
@@ -1175,15 +1301,74 @@ mod tests {
                     screen.show_help = show_help;
                     screen.selected_rows[PANEL_CONTAINERS] = row;
 
-                    let width = Line::from(screen.footer_hints()).width();
+                    let width = Line::from(screen.footer_hints(AVAILABLE)).width();
                     assert!(
                         width <= AVAILABLE,
                         "footer is {width} wide (panel {panel}, help {show_help}), \
                          an 80-column terminal fits {AVAILABLE}"
                     );
+
+                    // Only the arrows and Esc make way.
+                    let text = footer(&screen, AVAILABLE);
+                    let focused: &[&str] = if panel == PANEL_CONTAINERS {
+                        &["s: st", "d/D: delete/purge"]
+                    } else {
+                        &["↑↓: move", "c: create", "Esc: back"]
+                    };
+                    let always = ["Shift+↑↓: panel", ".: filter", "/: ", "q: quit"];
+                    for hint in focused.iter().chain(&always) {
+                        assert!(text.contains(hint), "no {hint:?} in {text:?}");
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_wide_footer_shows_every_hint() {
+        let screen = home(); // alpha, stopped
+        let full = footer(&screen, usize::MAX);
+        assert_eq!(
+            full,
+            " Shift+↑↓: panel ↑↓: move .: filter /: help s: start d/D: delete/purge Esc: back q: quit "
+        );
+
+        let width = Line::from(full.as_str()).width();
+        assert_eq!(footer(&screen, width), full);
+        // One column less and the arrows go first, then Esc.
+        assert_eq!(
+            footer(&screen, width - 1),
+            " Shift+↑↓: panel .: filter /: help s: start d/D: delete/purge Esc: back q: quit "
+        );
+        // What an 80-column terminal has room for, inside its border.
+        assert_eq!(
+            footer(&screen, 78),
+            " Shift+↑↓: panel .: filter /: help s: start d/D: delete/purge q: quit "
+        );
+    }
+
+    #[test]
+    fn a_narrow_footer_keeps_what_acts_on_the_focused_item() {
+        let screen = home();
+        assert_eq!(footer(&screen, 40), " s: start d/D: delete/purge q: quit ");
+        assert_eq!(footer(&screen, 20), " s: start q: quit ");
+        assert_eq!(footer(&screen, 9), " q: quit ");
+        assert_eq!(footer(&screen, 0), " ");
+    }
+
+    #[test]
+    fn delete_hints_show_only_while_a_container_is_focused() {
+        let mut screen = home();
+        assert!(footer(&screen, usize::MAX).contains(" d/D: delete/purge "));
+
+        screen.active_panel = PANEL_IMAGES;
+        assert!(!footer(&screen, usize::MAX).contains("delete"));
+
+        // The filter hides the only container.
+        screen.active_panel = PANEL_CONTAINERS;
+        screen.containers = vec![entry("alpha", "stopped")];
+        screen.container_filter = ContainerFilter::RunningOnly;
+        assert!(!footer(&screen, usize::MAX).contains("delete"));
     }
 
     #[test]
@@ -1309,7 +1494,7 @@ mod tests {
                 name: "db-1".to_string(),
                 image: "docker.io/library/postgres:latest".to_string(),
             },
-            result: Ok(()),
+            result: Ok(None),
         });
         app.drain_replies();
         assert_eq!(
@@ -1326,6 +1511,7 @@ mod tests {
             seq: refresh_seq,
             containers: Ok(containers),
             images: Ok(vec![image("postgres", "latest")]),
+            volumes: Ok(vec![]),
         });
         app.drain_replies();
         assert_eq!(
@@ -1347,6 +1533,7 @@ mod tests {
             seq,
             containers: Ok(home().containers),
             images: Ok(vec![image("alpine", "edge")]),
+            volumes: Ok(vec![]),
         });
         app.drain_replies();
         HomeScreen::handle_dialog_key(&mut app, KeyEvent::from(KeyCode::Enter));
@@ -1385,6 +1572,197 @@ mod tests {
         home_mut(&mut app).active_panel = PANEL_IMAGES;
         HomeScreen::handle_start_stop_container(&mut app);
         assert!(probe.actions().is_empty());
+    }
+
+    fn press_in_dialog(app: &mut App, key: KeyEvent) -> bool {
+        HomeScreen::handle_dialog_key(app, key)
+    }
+
+    fn delete(id: &str, force: bool, volumes: &[&str]) -> Action {
+        Action::DeleteContainer {
+            id: id.to_string(),
+            force,
+            volumes: volumes.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn d_asks_before_deleting_the_focused_container() {
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        home_mut(&mut app).selected_rows[PANEL_CONTAINERS] = 2; // charlie, stopped
+
+        HomeScreen::open_delete_dialog(&mut app, false);
+        assert!(probe.actions().is_empty(), "nothing goes before the answer");
+
+        // Keys that would act on the screen only reach the dialog.
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('s'),
+            KeyCode::Char('d'),
+            KeyCode::Up,
+        ] {
+            assert!(press_in_dialog(&mut app, KeyEvent::from(code)));
+        }
+        assert!(!app.exit);
+        assert_eq!(home_of(&app).selected_rows[PANEL_CONTAINERS], 2);
+        assert!(probe.actions().is_empty());
+
+        assert!(press_in_dialog(&mut app, KeyEvent::from(KeyCode::Enter)));
+        assert!(home_of(&app).delete_dialog.is_none());
+        assert_eq!(probe.actions(), [delete("charlie", false, &[])]);
+        // With the dialog gone, keys are no longer swallowed.
+        assert!(!press_in_dialog(&mut app, KeyEvent::from(KeyCode::Enter)));
+    }
+
+    #[test]
+    fn y_confirms_and_a_running_container_is_forced() {
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        home_mut(&mut app).selected_rows[PANEL_CONTAINERS] = 1; // bravo, running
+
+        HomeScreen::open_delete_dialog(&mut app, false);
+        press_in_dialog(&mut app, KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(probe.actions(), [delete("bravo", true, &[])]);
+    }
+
+    #[test]
+    fn esc_n_and_ctrl_c_cancel_the_delete() {
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        for key in [
+            KeyEvent::from(KeyCode::Esc),
+            KeyEvent::from(KeyCode::Char('n')),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            HomeScreen::open_delete_dialog(&mut app, true);
+            assert!(home_of(&app).delete_dialog.is_some());
+            assert!(press_in_dialog(&mut app, key));
+            assert!(home_of(&app).delete_dialog.is_none(), "{key:?}");
+        }
+
+        // Ctrl+Y isn't a yes.
+        HomeScreen::open_delete_dialog(&mut app, false);
+        press_in_dialog(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+        assert!(home_of(&app).delete_dialog.is_some());
+        assert!(probe.actions().is_empty());
+    }
+
+    #[test]
+    fn capital_d_takes_the_anonymous_volumes_only_it_mounts() {
+        let mut screen = home();
+        screen.containers[0].volumes = ["9af1", "pgdata", "shared"].map(String::from).to_vec();
+        screen.containers[2].volumes = vec!["shared".to_string()];
+        screen.volumes = vec![
+            volume("9af1", true),
+            volume("pgdata", false),
+            volume("shared", true),
+        ];
+        let (mut app, probe) = App::with_probe(Screen::Home(screen));
+
+        // `d` keeps all three.
+        HomeScreen::open_delete_dialog(&mut app, false);
+        press_in_dialog(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(probe.actions(), [delete("alpha", false, &[])]);
+
+        // A failure clears the way for another try.
+        let seq = app.refresh.sent;
+        probe.reply(Reply::Finished {
+            action: delete("alpha", false, &[]),
+            result: Err("busy".to_string()),
+        });
+        app.drain_replies();
+        assert!(app.refresh.sent > seq);
+
+        HomeScreen::open_delete_dialog(&mut app, true);
+        press_in_dialog(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(probe.actions(), [delete("alpha", false, &["9af1"])]);
+    }
+
+    #[test]
+    fn delete_needs_a_focused_container() {
+        let mut app = app_with(home());
+        home_mut(&mut app).active_panel = PANEL_IMAGES;
+        HomeScreen::open_delete_dialog(&mut app, false);
+        HomeScreen::open_delete_dialog(&mut app, true);
+        assert!(home_of(&app).delete_dialog.is_none());
+
+        let mut app = app_with(HomeScreen::new());
+        HomeScreen::open_delete_dialog(&mut app, true);
+        assert!(home_of(&app).delete_dialog.is_none());
+    }
+
+    #[test]
+    fn delete_waits_for_a_command_on_the_same_container() {
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        home_mut(&mut app).selected_rows[PANEL_CONTAINERS] = 1; // bravo
+        HomeScreen::handle_start_stop_container(&mut app);
+        assert_eq!(
+            probe.actions(),
+            [Action::StopContainer("bravo".to_string())]
+        );
+
+        HomeScreen::open_delete_dialog(&mut app, false);
+        assert!(home_of(&app).delete_dialog.is_none());
+
+        // Another container can go meanwhile.
+        home_mut(&mut app).selected_rows[PANEL_CONTAINERS] = 0;
+        HomeScreen::open_delete_dialog(&mut app, false);
+        assert!(home_of(&app).delete_dialog.is_some());
+    }
+
+    #[test]
+    fn the_dialog_closes_when_its_container_is_deleted_elsewhere() {
+        let mut app = app_with(home());
+        HomeScreen::open_delete_dialog(&mut app, false); // alpha
+        let screen = home_mut(&mut app);
+
+        screen.update(Ok(home().containers), Ok(vec![]), Ok(vec![]));
+        assert!(screen.delete_dialog.is_some());
+        // A list that couldn't be read proves nothing.
+        screen.update(Err("timeout".to_string()), Ok(vec![]), Ok(vec![]));
+        assert!(screen.delete_dialog.is_some());
+
+        screen.update(Ok(vec![entry("bravo", "running")]), Ok(vec![]), Ok(vec![]));
+        assert!(screen.delete_dialog.is_none());
+    }
+
+    #[test]
+    fn the_dialog_does_what_it_asked_even_if_the_container_changes() {
+        let (mut app, probe) = App::with_probe(Screen::Home(home()));
+        HomeScreen::open_delete_dialog(&mut app, false); // alpha, stopped
+
+        // Started elsewhere: the user wasn't asked about killing it, so the
+        // CLI refuses rather than forcing it.
+        home_mut(&mut app).update(Ok(vec![entry("alpha", "running")]), Ok(vec![]), Ok(vec![]));
+        press_in_dialog(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(probe.actions(), [delete("alpha", false, &[])]);
+    }
+
+    #[test]
+    fn the_dialog_is_drawn_over_the_lists() {
+        let mut app = app_with(home());
+        home_mut(&mut app).selected_rows[PANEL_CONTAINERS] = 1; // bravo
+        HomeScreen::open_delete_dialog(&mut app, true);
+
+        let rows = draw(home_mut(&mut app), &PendingActions::default(), 80, 24);
+        assert!(row_containing(&rows, "┌ Purge container ").is_some());
+        assert!(row_containing(&rows, "│ bravo is running. Kill it and delete it?").is_some());
+        assert!(row_containing(&rows, "│ It has no volumes.").is_some());
+        assert!(row_containing(&rows, "Enter: purge  Esc: cancel").is_some());
+        // The footer underneath doesn't change.
+        assert!(rows[23].contains("d/D: delete/purge"), "{}", rows[23]);
+    }
+
+    #[test]
+    fn a_container_being_deleted_says_so() {
+        let mut screen = home();
+        let mut pending = PendingActions::default();
+        pending.push(delete("bravo", true, &["9af1"]));
+        let rows = draw(&mut screen, &pending, 80, 24);
+
+        assert!(rows[4].contains("bravo           purging…"), "{}", rows[4]);
+        assert!(rows[1].ends_with(" Purging bravo… ┐┃"), "{}", rows[1]);
     }
 
     #[test]

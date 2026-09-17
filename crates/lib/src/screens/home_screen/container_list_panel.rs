@@ -4,9 +4,13 @@ use crate::screens::cli;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct ContainerEntry {
+    /// The name the container was created with (`--name`), or a UUID if it
+    /// was given none. The CLI has no separate name.
     pub(crate) id: String,
     pub(crate) state: String,
     pub(crate) addr: String,
+    /// The volumes it mounts, by name, in the order it mounts them.
+    pub(crate) volumes: Vec<String>,
 }
 
 impl ContainerEntry {
@@ -58,6 +62,9 @@ pub(crate) fn fetch_containers() -> Result<Vec<ContainerEntry>, String> {
 struct ContainerJson {
     id: Option<String>,
     status: Option<StatusJson>,
+    /// Kept untyped: only the mounts are read from it, and a mount of a
+    /// kind this parser doesn't know must not cost the whole entry.
+    configuration: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -88,8 +95,27 @@ impl From<ContainerJson> for ContainerEntry {
                 .filter(|a| !a.is_empty())
                 .collect::<Vec<_>>()
                 .join(","),
+            volumes: json
+                .configuration
+                .as_ref()
+                .map(volume_names)
+                .unwrap_or_default(),
         }
     }
+}
+
+/// The volumes among `configuration.mounts`, which look like
+/// `{"type": {"volume": {"name": "pgdata", …}}, …}`. Bind mounts and tmpfs
+/// have other keys under `type`. A name mounted twice is listed once.
+fn volume_names(configuration: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mounts = configuration["mounts"].as_array().into_iter().flatten();
+    for name in mounts.filter_map(|mount| mount["type"]["volume"]["name"].as_str()) {
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
 }
 
 /// Reads the list one container at a time, so a single entry the parser
@@ -130,7 +156,42 @@ mod tests {
         "status": { "networks": [], "state": "stopped" }
       },
       {
-        "configuration": { "id": "bravo" },
+        "configuration": {
+          "id": "bravo",
+          "mounts": [
+            {
+              "destination": "/scratch",
+              "options": [],
+              "source": "tmpfs",
+              "type": { "tmpfs": {} }
+            },
+            {
+              "destination": "/data",
+              "options": [],
+              "source": "/Users/me/Library/Application Support/com.apple.container/volumes/9af1cc76-45ca-4205-9ed8-df97a4f132a8/volume.img",
+              "type": {
+                "volume": {
+                  "cache": { "on": {} },
+                  "format": "ext4",
+                  "name": "9af1cc76-45ca-4205-9ed8-df97a4f132a8",
+                  "sync": { "fsync": {} }
+                }
+              }
+            },
+            {
+              "destination": "/src",
+              "options": ["ro"],
+              "source": "/Users/me/src",
+              "type": { "virtiofs": {} }
+            },
+            {
+              "destination": "/var/lib/postgresql",
+              "options": [],
+              "source": "/Users/me/Library/Application Support/com.apple.container/volumes/pgdata/volume.img",
+              "type": { "volume": { "format": "ext4", "name": "pgdata" } }
+            }
+          ]
+        },
         "id": "bravo",
         "status": {
           "networks": [
@@ -160,16 +221,40 @@ mod tests {
                     id: "alpha".to_string(),
                     state: "stopped".to_string(),
                     addr: String::new(),
+                    volumes: vec![],
                 },
                 ContainerEntry {
                     id: "bravo".to_string(),
                     state: "running".to_string(),
                     addr: "192.168.64.3/24".to_string(),
+                    volumes: vec![
+                        "9af1cc76-45ca-4205-9ed8-df97a4f132a8".to_string(),
+                        "pgdata".to_string(),
+                    ],
                 },
             ]
         );
         assert!(!entries[0].is_running());
         assert!(entries[1].is_running());
+    }
+
+    #[test]
+    fn odd_mounts_are_skipped_without_losing_the_container() {
+        let json = r#"[{"id": "web", "status": {"state": "running"}, "configuration": {"mounts": [
+            {"type": "volume"},
+            {"type": {"volume": {"name": 7}}},
+            {"type": {"volume": {"name": ""}}},
+            {"type": {"volume": {}}},
+            {},
+            "not a mount",
+            {"type": {"volume": {"name": "cache"}}},
+            {"type": {"volume": {"name": "cache"}}, "destination": "/again"}
+        ]}}, {"id": "db", "configuration": {"mounts": {"name": "pgdata"}}}]"#;
+        let entries = parse_containers(json).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "db");
+        assert!(entries[0].volumes.is_empty());
+        assert_eq!(entries[1].volumes, ["cache"]);
     }
 
     #[test]
