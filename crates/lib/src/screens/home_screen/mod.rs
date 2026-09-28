@@ -140,6 +140,13 @@ fn list_rows_area(area: Rect) -> Rect {
     }
 }
 
+/// Opens bash where the image has it, and `sh` otherwise: Alpine and BusyBox
+/// images ship only `sh`. `command -v` is built into `sh`, so any image with a
+/// shell can run it, and `exec` leaves no wrapper shell to exit twice.
+fn shell_command(id: &str) -> String {
+    format!("container exec -it {id} sh -c 'command -v bash >/dev/null && exec bash || exec sh'")
+}
+
 /// One list panel, ready to draw with `HomeScreen::render_list`.
 struct ListPanel<'a> {
     /// `PANEL_CONTAINERS` or `PANEL_IMAGES`.
@@ -488,6 +495,17 @@ impl HomeScreen {
         app.submit(action);
     }
 
+    /// What `E` copies for the focused container, or why it copies nothing:
+    /// `container exec` only reaches a running container.
+    pub(crate) fn focused_shell_command(&self) -> Option<Result<String, String>> {
+        let container = self.focused_container()?;
+        Some(if container.is_running() {
+            Ok(shell_command(&container.id))
+        } else {
+            Err(format!("Start {} first", container.id))
+        })
+    }
+
     pub(crate) fn handle_esc(app: &mut App) {
         match app.screen {
             // Esc dismisses the help panel before it leaves the screen.
@@ -581,6 +599,14 @@ impl HomeScreen {
         }
         if self.focused_container().is_some() {
             hints.push(Hint::new("d/D", "delete/purge", 6));
+        }
+        if self
+            .focused_container()
+            .is_some_and(ContainerEntry::is_running)
+        {
+            // Below the filter, so on an 80-column terminal it is the one
+            // that makes way.
+            hints.push(Hint::new("E", "shell", 2));
         }
         if self.focused_image().is_some() {
             hints.push(Hint::new("c", "create", 6));
@@ -1572,6 +1598,30 @@ mod tests {
         home_mut(&mut app).active_panel = PANEL_IMAGES;
         HomeScreen::handle_start_stop_container(&mut app);
         assert!(probe.actions().is_empty());
+    }
+
+    #[test]
+    fn e_copies_a_shell_command_only_for_a_running_container() {
+        let mut screen = home();
+        screen.selected_rows[PANEL_CONTAINERS] = 1; // bravo, running
+        assert_eq!(
+            screen.focused_shell_command(),
+            Some(Ok(
+                "container exec -it bravo sh -c 'command -v bash >/dev/null && exec bash || exec sh'"
+                    .to_string()
+            ))
+        );
+        assert!(footer(&screen, usize::MAX).contains(" E: shell "));
+
+        screen.selected_rows[PANEL_CONTAINERS] = 0; // alpha, stopped
+        assert_eq!(
+            screen.focused_shell_command(),
+            Some(Err("Start alpha first".to_string()))
+        );
+        assert!(!footer(&screen, usize::MAX).contains("shell"));
+
+        screen.active_panel = PANEL_IMAGES;
+        assert_eq!(screen.focused_shell_command(), None);
     }
 
     fn press_in_dialog(app: &mut App, key: KeyEvent) -> bool {

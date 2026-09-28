@@ -37,6 +37,12 @@ impl Notice {
         Self::new(copied_message(text), false)
     }
 
+    /// A command was copied to be pasted into another terminal, so the notice
+    /// shows the command itself rather than how long it is.
+    pub(crate) fn copied_command(command: &str) -> Self {
+        Self::new(format!("Copied: {command}"), false)
+    }
+
     pub(crate) fn copy_failed() -> Self {
         Self::new("Copy failed".to_string(), true)
     }
@@ -81,9 +87,10 @@ impl Notice {
     }
 
     /// Drawn over the top border, where every screen has one, clear of the
-    /// centred title.
+    /// centred title. Text too wide for the border ends in `…`.
     fn render_on_border(&self, area: Rect, buf: &mut Buffer) {
-        let text = format!(" {} ", self.text);
+        let room = (area.width as usize).saturating_sub(4);
+        let text = format!(" {} ", shorten(&self.text, room.saturating_sub(2)));
         let line = if self.is_error {
             Line::from(text).red().bold()
         } else {
@@ -199,6 +206,27 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// `text` cut to at most `width` columns, ending in `…` if anything was cut.
+fn shorten(text: &str, width: usize) -> String {
+    if width_of(text) <= width {
+        return text.to_string();
+    }
+    let mut short = String::new();
+    let mut short_width = 0;
+    for ch in text.chars() {
+        let ch_width = width_of(ch.encode_utf8(&mut [0; 4]));
+        if short_width + ch_width + 1 > width {
+            break;
+        }
+        short.push(ch);
+        short_width += ch_width;
+    }
+    if width > 0 {
+        short.push('…');
+    }
+    short
+}
+
 /// "Copied 1 character" / "Copied 12 characters". Counts characters, not
 /// bytes, so non-ASCII text reads the way it looks.
 fn copied_message(text: &str) -> String {
@@ -246,6 +274,16 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
         Notice::copied("bravo").render(buf.area, &mut buf);
         assert_eq!(row(&buf, 0), format!("{:>38}  ", " Copied 5 characters "));
+    }
+
+    #[test]
+    fn a_notice_too_wide_for_the_border_ends_in_an_ellipsis() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 3));
+        Notice::copied_command("container exec -it bravo sh").render(buf.area, &mut buf);
+        assert_eq!(row(&buf, 0), "   Copied: container exec …   ");
+        assert_eq!(shorten("abc", 3), "abc");
+        assert_eq!(shorten("abcd", 3), "ab…");
+        assert_eq!(shorten("abcd", 0), "");
     }
 
     #[test]

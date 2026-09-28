@@ -423,6 +423,22 @@ impl App {
         });
     }
 
+    /// `E` — copies a command that opens a shell in the focused container,
+    /// for pasting into another terminal.
+    fn copy_shell_command(&mut self) {
+        let Screen::Home(home) = &self.screen else {
+            return;
+        };
+        self.notice = match home.focused_shell_command() {
+            Some(Ok(command)) => Some(match copy_to_clipboard(&command) {
+                Ok(()) => Notice::copied_command(&command),
+                Err(_) => Notice::copy_failed(),
+            }),
+            Some(Err(reason)) => Some(Notice::done(reason)),
+            None => return,
+        };
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         // The create-container dialog is modal: while it is open it takes every
         // key, so none of the shortcuts below fire.
@@ -448,6 +464,7 @@ impl App {
             KeyCode::Char('c') => HomeScreen::open_create_dialog(self),
             KeyCode::Char('d') if plain => HomeScreen::open_delete_dialog(self, false),
             KeyCode::Char('D') if plain => HomeScreen::open_delete_dialog(self, true),
+            KeyCode::Char('E') if plain => self.copy_shell_command(),
             KeyCode::Up if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
                 HomeScreen::handle_shift_up(self)
             }

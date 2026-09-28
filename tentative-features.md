@@ -61,7 +61,7 @@ Most of the features below depend on these, so they come first.
 | Remove (asks before forcing a running container) | `delete [--force]` | ✅ `d` |
 | Remove with volumes (`docker rm -v`) | no flag: `delete`, then `volume delete` for its anonymous volumes | ✅ `D`, "purge" |
 | Restart | no command; `stop` then `start` | ❌ |
-| Shell into a container | `exec -it <id> sh` | ❌ (only in the help panel text) |
+| Shell into a container | `exec -it <id> sh` | ✅ `E` copies the command |
 | Logs tab | `logs -f -n <lines>`, plus `--boot` | ❌ |
 | Stats tab with graphs | `stats --format json` | ❌ |
 | Env / Config / Top tabs | list JSON, `inspect`, `exec <id> ps` | ❌ |
@@ -96,12 +96,15 @@ screen text by dragging.
   `start`.
 - [ ] **`K` kill** with `container kill`, optionally choosing a signal with
   `--signal`.
-- [ ] **`E` shell:**
-  - Suspend the TUI: leave the alternate screen and turn off raw mode and
-    **mouse capture**.
-  - Run `container exec -it <id> sh` in the real terminal.
-  - When it exits, restore the TUI and redraw everything.
-  - Use `sh`, since many images don't include bash.
+- [x] **`E` shell** copies a command that opens a shell in the selected
+  running container, for pasting into another terminal. The notice shows
+  the command. The TUI keeps running:
+  `container exec -it <id> sh -c 'command -v bash >/dev/null && exec bash || exec sh'`
+  - It opens bash where the image has it, and `sh` otherwise, since many
+    images (Alpine, BusyBox) don't include bash. An image with no shell at
+    all (distroless, scratch) fails with the CLI's own error.
+  - On a stopped container, `E` says to start it first, because `exec` only
+    works on running containers.
 - [ ] **More container columns.** The `container ls --format json` output
   already carries the image, OS, architecture, CPUs, memory and start time,
   but `parse_containers` only keeps ID, state and IP. Hide the less important
@@ -215,7 +218,7 @@ Existing keys keep their meaning, except help, which moves from `/` to `?`.
 | `d` | images | delete, after asking | new |
 | `r` | containers | restart | new |
 | `K` | containers | kill | new |
-| `E` | containers | shell | new |
+| `E` | containers | copy a shell command | existing |
 | `y` | containers | copy IP or ID | new |
 | `Enter` | home screen | focus the detail pane | new |
 | `[` `]` | home screen | previous / next tab | new |
