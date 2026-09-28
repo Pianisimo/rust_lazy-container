@@ -58,7 +58,7 @@ crates/
 
 ### Shared lib crate (`crates/lib`)
 
-`lib` exports a reusable `App` struct (counter with `u8` value, `exit` flag) and its `Widget` implementation. `lazy-container` depends on `lib` and delegates directly to it. The examples are fully self-contained — they duplicate the same patterns rather than depending on `lib`.
+`lib` exports `App`, the lazy-container TUI: the status and home screens in `src/screens/`, with `Widget` implemented for `&App`. `lazy-container` depends on `lib` and delegates directly to it. The examples are fully self-contained — they duplicate the same patterns rather than depending on `lib`.
 
 ### Ratatui app pattern
 
